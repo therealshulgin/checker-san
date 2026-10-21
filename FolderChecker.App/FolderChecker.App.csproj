@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CheckerSan</AssemblyName>
+    <Title>Checker San</Title>
+    <Product>Checker San</Product>
+    <Authors>therealshulgin</Authors>
+    <Description>Comparaison fiable de dossiers et de fichiers sous Windows.</Description>
+    <ApplicationIcon>Assets/CheckerSan.ico</ApplicationIcon>
+    <RootNamespace>FolderChecker.App</RootNamespace>
+    <Version>1.0.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="../FolderChecker.Core/FolderChecker.Core.csproj" /></ItemGroup>
+</Project>
