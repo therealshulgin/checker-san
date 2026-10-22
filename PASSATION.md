@@ -1,11 +1,11 @@
 # Checker San — Passation pour la prochaine session
 
-Dernière mise à jour : **21 octobre 2026**. Ce document décrit l’état des sources, les nouvelles fonctionnalités de performance/doublons et les vérifications historiques. La validation finale de cette nouvelle version est distinguée des tests antérieurs ci-dessous. Les chemins de code ci-dessous sont relatifs à la racine du projet.
+Dernière mise à jour : **21 octobre 2026**. Ce document décrit les sources, la version performance/doublons déjà validée et l’ajout EN/FR en cours de validation. Les résultats historiques ci-dessous ne constituent pas une validation de la nouvelle localisation. Les chemins de code ci-dessous sont relatifs à la racine du projet.
 
 ## À lire en premier
 
 - **Application existante et fonctionnelle en local**, avec comparaison, reprise du scan, copie des manquants et reprise de copie. La nouvelle évolution ajoute des optimisations de lecture et un mode de recherche/retrait des doublons dans un dossier. Il ne s’agit pas d’un projet à recommencer.
-- Nom public et titre des fenêtres : **Checker San**, sans suffixe. Interface française, fonds noirs et gris neutres, boutons rose doux ; les fonds rose/violet ont été retirés. Le slogan sous le nom a été retiré ; les dossiers 1 et 2 ont des libellés neutres, sans copie à conserver prédéfinie. Employer « fichier », jamais un vocabulaire limité aux médias comme « rush ».
+- Nom public et titre des fenêtres : **Checker San**, sans suffixe. Interface EN/FR en cours d’intégration, fonds noirs et gris neutres, boutons rose doux ; les fonds rose/violet ont été retirés. Le slogan sous le nom a été retiré ; les dossiers 1 et 2 ont des libellés neutres, sans copie à conserver prédéfinie. Employer « fichier », jamais un vocabulaire limité aux médias comme « rush ».
 - Tous les types de fichiers sont concernés, avec les sous-dossiers et dossiers vides.
 - **Publication initiale autorisée explicitement le 21 octobre 2026.** Dépôt : <https://github.com/therealshulgin/checker-san>, compte **therealshulgin**, branche `main`. Le dépôt distant était vide avant cette publication. L’autorisation concerne le code, les tests et les documents de cette version.
 - L’identité du commit utilise le nom `therealshulgin` et son adresse GitHub privée fondée sur l’identifiant public du compte. Vérifier l’état et les commits avec `git status` et `git log` lors d’une reprise. Aucune licence n’a été choisie par l’utilisateur : ne pas en inventer.
@@ -28,6 +28,7 @@ Demandes implémentées :
 8. Copie des éléments manquants vers le dossier 1, vers le dossier 2 ou dans les deux sens en une seule opération, après aperçu avec volumes et destinations, reprise persistante et contrôle d’intégrité.
 9. Réutilisation des vérifications précédentes activée par défaut après contrôle des identités et métadonnées ; présélection des gros fichiers par petits blocs pour écarter les contenus différents avant le SHA complet.
 10. Recherche récursive des doublons dans un seul dossier, avec cache/reprise séparé, regroupement par contenu SHA-256 et retrait explicite des copies choisies : mise à l’écart réversible manuellement ou suppression définitive.
+11. Localisation EN/FR en cours de validation : sélecteur mémorisé, interface et messages traduits, formats de nombres/tailles adaptés et README public succinct en anglais.
 
 ## Emplacement et livrables
 
@@ -38,29 +39,32 @@ Les chemins ci-dessous sont relatifs à la racine du checkout local de `checker-
 | Application Windows x64 autonome | `dist/CheckerSan/CheckerSan.exe` |
 | Archive de distribution | `dist/CheckerSan-Windows-x64.zip` |
 | Lanceur à double-cliquer | `Lancer Checker San.cmd` |
-| Mode d’emploi et limites détaillées | `README.md` |
+| Présentation et démarrage en anglais | `README.md` |
 | Mode d’emploi inclus dans la distribution | `dist/CheckerSan/Mode-emploi.md` |
 | Compilation, tests et paquet | `build.ps1` |
 | Présente passation | `PASSATION.md` |
 
 L’exécutable n’exige pas d’installation de Python ou de .NET sur le poste utilisateur. Il est publié en fichier unique avec son environnement .NET. La première ouverture peut extraire des composants dans le répertoire temporaire Windows. La version déclarée du projet est `1.0.0`.
 
-SHA-256 de l’exécutable livré le **21 octobre 2026**, avec optimisations et mode Doublons :
+SHA-256 historique de l’exécutable livré le **21 octobre 2026**, avec optimisations et mode Doublons, **avant la localisation EN/FR** :
 
 ```text
 F93E6DCEE699D3475869FC3B7A64B2A9EB337476E61BB679C0F1D4A46FCE6FDE
 ```
 
-L’exécutable et l’archive ont été reconstruits après validation des tests et du rendu WPF. Le ZIP contient uniquement `CheckerSan.exe` et `Mode-emploi.md` ; un fichier `CheckerSan.rar` déjà présent dans le répertoire de distribution a été laissé intact et exclu du paquet. Le script utilise désormais une liste explicite des fichiers à empaqueter. Les anciens livrables nommés `FolderCheck` ont été supprimés de `dist` lors d’une session précédente.
+Cet exécutable et son archive ont été reconstruits après validation des tests et du rendu WPF de la version précédente. Ne pas attribuer cette empreinte à la version EN/FR ; elle devra être remplacée après sa publication locale vérifiée. Le ZIP contient uniquement `CheckerSan.exe` et `Mode-emploi.md` ; un fichier `CheckerSan.rar` déjà présent dans le répertoire de distribution a été laissé intact et exclu du paquet. Le script utilise désormais une liste explicite des fichiers à empaqueter. Les anciens livrables nommés `FolderCheck` ont été supprimés de `dist` lors d’une session précédente.
 
 ## Organisation du code
 
-Dernier ajustement visuel : badge « Local & réseau » supprimé de l’en-tête à la demande de l’utilisateur. Le bouton « Doublons dans un dossier… » reste aligné à droite. Compilation et archive reconstruites avec succès ; pas de nouvelle batterie de tests pour cette suppression de texte décoratif. Les résultats de tests ci-dessous précèdent uniquement cet ajustement.
+Ajustement visuel précédant la localisation : badge « Local & réseau » supprimé de l’en-tête à la demande de l’utilisateur. Le bouton « Doublons dans un dossier… » reste aligné à droite. Compilation et archive reconstruites avec succès ; pas de nouvelle batterie de tests pour cette suppression de texte décoratif. Les résultats de tests ci-dessous précèdent uniquement cet ajustement.
 
 Application C# / **WPF .NET 10**, sans bibliothèque applicative tierce. Les noms internes `FolderChecker.*` sont conservés ; le nom distribué et les textes utilisateur sont **Checker San**.
 
 | Fichier ou projet | Rôle |
 |---|---|
+| `FolderChecker.Core/L.cs` | Langue partagée fr/en, choix des textes et formatage localisé ; événement Changed. |
+| `FolderChecker.App/AppLanguage.cs` | Ressources WPF, culture et préférence de langue persistante, initialisée au démarrage réel. |
+| `FolderChecker.App/Strings.Main.cs` et `Strings.Duplicates.cs` | Catalogues de paires FR/EN pour les ressources dynamiques Main_* et Dup_*. |
 | `FolderChecker.Core/Models.cs` | Options, lignes, états, progression et verdicts de comparaison. |
 | `FolderChecker.Core/ComparisonEngine.cs` | Inventaire, présélection des gros fichiers, SHA-256, recherche indexée des déplacements, contrôle final, reprise et verdicts. |
 | `FolderChecker.Core/CheckpointData.cs` | Lecture et format du journal de scan, schéma JSON 1. |
@@ -69,7 +73,7 @@ Application C# / **WPF .NET 10**, sans bibliothèque applicative tierce. Les nom
 | `FolderChecker.Core/DuplicateModels.cs` | Options, progression, fichiers/groupes et résultats du scan de doublons. |
 | `FolderChecker.Core/DuplicateEngine.cs` | Inventaire d’un dossier, filtrage taille/échantillons, SHA-256, liens physiques, contrôle final et journal séparé. |
 | `FolderChecker.Core/DuplicateRemoval.cs` | Validation de la sélection, protection de la copie conservée, quarantaine et suppression par handles Windows. |
-| `FolderChecker.Core/CopyEngine.cs` | Plans de copie unidirectionnels/bidirectionnels, journal schéma 2 compatible schéma 1, temporaires, reprise, SHA-256 et validation sans écrasement. |
+| `FolderChecker.Core/CopyEngine.cs` | Plans de copie unidirectionnels/bidirectionnels, journal incrémental (plan schéma 2 compatible schéma 1, puis états ajoutés), temporaires, reprise, SHA-256 et validation sans écrasement. |
 | `FolderChecker.App/App.xaml` | Styles WPF : fonds noirs/gris neutres, contrôles, tableaux, menus et boutons roses. |
 | `FolderChecker.App/MainWindow.xaml` | Structure de la fenêtre principale. |
 | `FolderChecker.App/MainWindow.xaml.cs` | Lancement/arrêt/reprise du scan, résultats, sélection, export et aide. |
@@ -78,7 +82,7 @@ Application C# / **WPF .NET 10**, sans bibliothèque applicative tierce. Les nom
 | `FolderChecker.App/DuplicatesWindow.xaml` et `.xaml.cs` | Fenêtre doublons, choix du dossier, scan/reprise, sélection volontaire, retrait et invalidation des résultats. |
 | `FolderChecker.App/DuplicateRowView.cs` | Cases à cocher et état conservé/à retirer de chaque copie. |
 | `FolderChecker.App/DuplicateRemovalDialog.cs` | Aperçu des chemins à retirer/conserver et consentement explicite à la suppression définitive. |
-| `FolderChecker.App/RowView.cs` | Présentation française des états, tailles et couleurs. |
+| `FolderChecker.App/RowView.cs` | États/types localisés, tailles selon la culture et couleurs. |
 | `FolderChecker.App/ReportWriter.cs` | Export complet CSV/JSON et protections des chemins de sortie. |
 | `FolderChecker.App/Assets/CheckerSan.ico` | Icône distribuée. |
 | `tools/generate_icon.py` | Génération de l’icône ; Pillow nécessaire uniquement pour la régénérer. |
@@ -86,6 +90,23 @@ Application C# / **WPF .NET 10**, sans bibliothèque applicative tierce. Les nom
 | `FolderChecker.App.Tests` | Programme de tests des rapports et de l’invalidation des résultats dans WPF. |
 
 Le manifeste Windows active notamment les chemins longs et le DPI par moniteur. L’application s’exécute avec les droits ordinaires de l’utilisateur. La fenêtre et le dialogue de copie ont une barre de titre sombre.
+
+## Localisation EN/FR — intégration en cours
+
+L’utilisateur a demandé un sélecteur français/anglais, un README succinct en anglais et la publication de cette évolution. Cette section décrit les sources et le contrat d’intégration ; elle ne renseigne aucun nouveau résultat de tests, de compilation ou de push.
+
+- `FolderChecker.Core/L.cs` conserve `Language` (`fr` ou `en`), `IsEnglish`, `Culture` (`fr-FR`/`en-US`) et l’événement `Changed`. `T(string french, string english)` choisit un texte ; `F(FormattableString french, FormattableString english)` formate dans la culture choisie. `SetLanguage` valide les deux codes et déclenche l’événement uniquement si la langue change. Le défaut du moteur reste français pour préserver les tests existants.
+- `AppLanguage.Initialize(string? settingsPath=null, CultureInfo? systemCulture=null)` est appelé uniquement par `App.OnStartup`. Il charge `%LOCALAPPDATA%\CheckerSan\settings.json` (distinct des journaux), limité à 4 Kio, avec `Version=1` et `Language=fr/en`. Un fichier absent, incorrect, inaccessible ou une langue inconnue entraîne un choix français si la culture Windows commence par `fr`, anglais sinon.
+- `AppLanguage.Apply(string language, bool persist=true, string? settingsPath=null)` met à jour la culture courante et celle des futurs threads, remplit les ressources puis appelle `L.SetLanguage`. Les abonnés à `Changed` voient donc les ressources et formats actualisés. La sauvegarde utilise un temporaire dans le même dossier, `Flush(true)` et un remplacement atomique. L’échec de sauvegarde ne bloque pas le changement ; `LastSaveError` conserve le message.
+- `AppLanguage.InitializeResources(ResourceDictionary? resources=null)` remplit les ressources de la langue courante sans accès disque. Les tests ne doivent pas déclencher `OnStartup` ni lire les vraies préférences : injecter chemin/culture dans `Initialize`, utiliser `Apply(..., persist:false)` et initialiser les ressources explicitement après `Application.InitializeComponent`.
+- `Strings.Main.cs` et `Strings.Duplicates.cs` exposent les catalogues `IReadOnlyDictionary<string,(string Fr,string En)>`. Les libellés XAML passent par `{DynamicResource Main_*}` ou `{DynamicResource Dup_*}`. Le nom du produit reste **Checker San**, les choix restent **English** et **Français**.
+- `MainWindow.xaml` ajoute `LanguageBox`, `SelectedValuePath="Tag"`, avec `en` et `fr`, et `SelectionChanged="Language_Changed"`. Le code principal doit appliquer/synchroniser le choix et rafraîchir les textes générés en C#. Le sélecteur est à désactiver pendant une opération pour ne pas mélanger les langues dans le même scan ; les dialogues modaux bloquent déjà la fenêtre propriétaire.
+- `RowView` et les écrans/dialogues de doublons/copie traduisent états, actions, prévisualisations et détails générés. Les tailles utilisent `B/KiB/MiB/...` en anglais, `o/Kio/Mio/...` en français. Les textes d’aide, progression et erreurs applicatives passent par `L.T`/`L.F`. Les messages natifs de Windows peuvent rester dans la langue du système.
+- **Les diagnostics déjà produits par un scan conservent leur langue d’origine** : `ComparisonRow.Detail`, erreurs et avertissements sont des chaînes matérialisées. Changer la langue actualise les libellés de l’interface, mais ne réécrit pas rétroactivement ces preuves. Un nouveau scan produit de nouveaux diagnostics dans la langue choisie.
+- `ReportWriter` localise les titres/états/verdicts CSV et les descriptions Algorithm/Scope du JSON. Les noms de champs JSON, enums, empreintes, chemins, tailles brutes et formats des journaux restent inchangés. Les diagnostics originaux sont conservés. Le CSV garde ses 19 colonnes, son BOM UTF-8 et ses protections contre les formules.
+- `README.md` est remplacé par une présentation anglaise d’au plus 350 mots : construction, usage, comparaison/copie, doublons, limites et choix de langue. `build.ps1` doit en recopier la version courante dans la distribution lors de la publication locale.
+
+**À compléter après intégration seulement :** résultats réels des tests EN/FR et des suites existantes, vérification des changements de langue sans scan/suppression accidentels, sérialisation des préférences dans des fixtures, rendu WPF des deux langues, nouveau SHA-256 de l’exécutable, distribution et statut réel du push demandé. Les résultats « 135 tests » et l’empreinte ci-dessus concernent la version précédente.
 
 ## Garanties à conserver lors des modifications
 
@@ -157,6 +178,9 @@ Journal par défaut :
 - Écriture dans `.checkersan-<GUID>.partial`, dans le dossier de destination. La destination finale existante n’est jamais écrasée.
 - À la reprise : identification du temporaire, comparaison octet par octet de son préfixe avec la source, puis poursuite à l’offset déjà écrit. Cette vérification nécessite de relire la partie transférée.
 - Vérification SHA-256 complète de la copie avant renommage sans écrasement. Le journal permet de traiter une interruption entre validation et finalisation.
+- **Journal incrémental (22 octobre 2026).** `copy.json` est un fichier JSON Lines : la première ligne est le plan complet (schéma 1 ou 2, inchangé) ; chaque ligne suivante est le dernier état d’un élément (`Completed`, `VerifiedHash`, `PartialIdentity`, `DestinationIdentity`), identifié par son `PartialName`, désormais unique dans tout le plan. Le plan n’est réécrit (temporaire + `Flush(true)` + remplacement) qu’au démarrage, lorsque les états ajoutés atteignent un quart de sa taille (minimum 1 Mio), et à l’arrêt. Un arrêt normal, une annulation ou une erreur laissent donc une seule ligne, lisible par les versions précédentes. Auparavant, le plan entier était réécrit et forcé sur disque trois fois par fichier, d’où un coût quadratique : 2 000 petits fichiers prenaient 93,8 s, contre 9,0 s maintenant (environ 4,5 ms par fichier, constant jusqu’à 5 000 fichiers). Cette réécriture continuelle provoquait aussi des « Accès refusé » sporadiques, probablement dus à l’antivirus.
+- Chaque état ajouté est transmis au cache système, ce qui survit à un plantage de l’application ; il n’est forcé sur disque qu’au plus une fois par seconde. Une coupure de courant peut donc perdre les derniers états : la reprise refuse alors les éléments concernés (destination existante sans empreinte, temporaire non identifié) au lieu de les accepter ou de les écraser. Une nouvelle comparaison les classe ensuite normalement. `ReadPlan` ignore une ligne illisible, tronquée, inconnue ou à l’empreinte invalide ; l’élément garde alors son état précédent. Les données de chaque copie restent forcées sur disque avant le renommage final.
+- Progression : chaque changement de phase ou d’élément est signalé ; à l’intérieur d’une même phase, les compteurs d’octets le sont au plus toutes les 100 ms (auparavant un rapport forcé par Mio et cinq par fichier). Les observateurs des tests, qui interrompent après le premier bloc ou le premier fichier terminé, restent déterministes.
 - Les fichiers déjà terminés sont contrôlés avant d’être conservés. Une source modifiée ou un préfixe corrompu bloque la copie concernée.
 - Une nouvelle copie peut remplacer le dernier journal ; une seule session de copie est proposée à la reprise. Des temporaires abandonnés peuvent rester sur la destination. Ne pas les supprimer automatiquement sans établir qu’ils appartiennent à une opération abandonnée.
 - Relancer une comparaison après copie pour obtenir un verdict actualisé : un transfert terminé ne résout pas les contenus différents au même chemin. Le dialogue « Compléter les dossiers… » propose par défaut les deux sens, sauf si une reprise est disponible (prioritaire). Chaque ligne et chaque volume de la prévisualisation indiquent leur direction. Il s’agit d’une opération à la demande, sans surveillance permanente ni propagation des suppressions.
@@ -232,7 +256,17 @@ L’automatisation native de l’interface a utilisé le skill `computer-use` et
 
 La livraison précédente ajoutait la copie bidirectionnelle en une opération et la palette noire/grise. Ses 85 tests automatisés passaient, dont les trois choix du dialogue et la reprise dans le second sens. Le lancement pour contrôle visuel a été interrompu par l’utilisateur avec la touche Échap : aucune autre automatisation native n’a été effectuée ensuite et le contrôle visuel de cette dernière palette reste à faire. Les fixtures créées à cet effet se trouvent dans `.test-data/ui-sync-4065442190d649a7800d6f0ed5c76e18` ; aucun scan ni transfert n’a été lancé dessus depuis l’interface. Les journaux de session étaient absents avant cette tentative.
 
-## Validation de la nouvelle version — 21 octobre 2026
+## Validation du journal de copie incrémental — 22 octobre 2026
+
+**147 tests réussis, aucun échec** : 119 tests moteur et 28 tests WPF/rapports, en Release avec le SDK local, sur les sources EN/FR non commitées. La distribution `dist` n’a pas été reconstruite et l’empreinte de l’exécutable n’a pas changé. Trois tests ont été ajoutés dans `FolderChecker.Tests/CopyJournalTests.cs` :
+
+- reprise d’un instantané du journal pris pendant la copie (états ajoutés), avec lignes invalides, inconnues et tronquée ignorées, et journal réduit à une ligne après l’arrêt ;
+- performance : pour 400 petits fichiers, les octets écrits par le processus pour le journal (compteurs d’E/S Windows) restent inférieurs à 16 fois la taille finale du plan ;
+- progression : un fichier de 24 Mio produit au plus 4 rapports plus un par tranche de 100 ms.
+
+Les trois tests échouent avec l’ancien `CopyEngine.cs` ; l’ancien moteur a même laissé deux fichiers sur 400 en « Accès refusé » sur le journal.
+
+## Validation historique performance/doublons — avant EN/FR, 21 octobre 2026
 
 **135 tests réussis, aucun échec, aucun test ignoré** : 110 tests moteur et 25 tests WPF/rapports. Exécution en Release avec le SDK local, puis publication via `build.ps1` sans répéter les tests déjà passés. La compilation produit toujours un avertissement NU1900 : le service NuGet de données de vulnérabilités est inaccessible dans cet environnement ; la restauration et la publication ont réussi avec les paquets disponibles.
 

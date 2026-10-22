@@ -17,21 +17,21 @@ public sealed class DuplicateRemovalDialog : Window
         var permanent = mode == DuplicateRemovalMode.Permanent;
         var panel = new DockPanel { Margin = new Thickness(24) };
         var header = new StackPanel();
-        header.Children.Add(new TextBlock { Text = permanent ? "Supprimer les copies sélectionnées" : "Mettre les copies à l’écart", FontSize = 24, FontWeight = FontWeights.SemiBold });
+        header.Children.Add(new TextBlock { Text = permanent ? L.T("Supprimer les copies sélectionnées", "Delete selected copies") : L.T("Mettre les copies à l’écart", "Move copies aside"), FontSize = 24, FontWeight = FontWeights.SemiBold });
         var selectedFiles = scan.Groups.SelectMany(group => group.Files).Where(file => chosen.Contains(file.FullPath)).ToArray();
-        header.Children.Add(new TextBlock { Text = $"{selectedFiles.Length:N0} fichier(s) · {RowView.FormatSize(selectedFiles.Sum(file => file.Size))}\nDossier : {scan.Root}", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 12) });
+        header.Children.Add(new TextBlock { Text = L.F($"{selectedFiles.Length:N0} fichier(s) · {RowView.FormatSize(selectedFiles.Sum(file => file.Size))}\nDossier : {scan.Root}", $"{selectedFiles.Length:N0} file(s) · {RowView.FormatSize(selectedFiles.Sum(file => file.Size))}\nFolder: {scan.Root}"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 12) });
         header.Children.Add(new TextBlock { Text = permanent
-            ? "Les fichiers ci-dessous seront supprimés définitivement, sans Corbeille. Vérifiez les chemins des fichiers retirés et des exemplaires conservés."
-            : "Les fichiers seront déplacés dans .CheckerSan-Quarantine, avec leurs chemins relatifs. Vous pourrez les remettre en place manuellement. Cette opération ne libère pas d’espace.",
+            ? L.T("Les fichiers ci-dessous seront supprimés définitivement, sans Corbeille. Vérifiez les chemins des fichiers retirés et des exemplaires conservés.", "The files listed below will be permanently deleted without the Recycle Bin. Review the paths of both removed and retained copies.")
+            : L.T("Les fichiers seront déplacés dans .CheckerSan-Quarantine, avec leurs chemins relatifs. Vous pourrez les remettre en place manuellement. Cette opération ne libère pas d’espace.", "Files will be moved into .CheckerSan-Quarantine with their relative paths preserved. You can restore them manually. This does not free any space."),
             Foreground = RowView.Brush("#B8B8B8"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) });
-        header.Children.Add(new TextBlock { Text = "Les doublons concernent le contenu principal des fichiers. Les noms, dates, autorisations et flux NTFS alternatifs peuvent différer.", TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#B8B8B8"), Margin = new Thickness(0, 0, 0, 14) });
+        header.Children.Add(new TextBlock { Text = L.T("Les doublons concernent le contenu principal des fichiers. Les noms, dates, autorisations et flux NTFS alternatifs peuvent différer.", "Duplicates refer to the main file contents. Names, dates, permissions and NTFS alternate streams may differ."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#B8B8B8"), Margin = new Thickness(0, 0, 0, 14) });
         DockPanel.SetDock(header, Dock.Top); panel.Children.Add(header);
         var footer = new StackPanel { Margin = new Thickness(0, 14, 0, 0) };
-        var consent = new CheckBox { Content = "Je confirme la suppression définitive des fichiers listés.", Margin = new Thickness(0, 0, 0, 14), Visibility = permanent ? Visibility.Visible : Visibility.Collapsed };
+        var consent = new CheckBox { Content = L.T("Je confirme la suppression définitive des fichiers listés.", "I confirm permanent deletion of the listed files."), Margin = new Thickness(0, 0, 0, 14), Visibility = permanent ? Visibility.Visible : Visibility.Collapsed };
         RegisterName("PermanentConsent", consent); footer.Children.Add(consent);
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-        var cancel = new Button { Content = "Annuler", IsCancel = true, Margin = new Thickness(0, 0, 8, 0) };
-        var confirm = new Button { Content = permanent ? "Supprimer définitivement" : "Mettre à l’écart", IsEnabled = false, Style = (Style)Application.Current.FindResource("PrimaryButton") };
+        var cancel = new Button { Content = L.T("Annuler", "Cancel"), IsCancel = true, Margin = new Thickness(0, 0, 8, 0) };
+        var confirm = new Button { Content = permanent ? L.T("Supprimer définitivement", "Delete permanently") : L.T("Mettre à l’écart", "Move aside"), IsEnabled = false, Style = (Style)Application.Current.FindResource("PrimaryButton") };
         RegisterName("ConfirmRemovalButton", confirm);
         buttons.Children.Add(cancel); buttons.Children.Add(confirm); footer.Children.Add(buttons);
         DockPanel.SetDock(footer, Dock.Bottom); panel.Children.Add(footer);
@@ -41,9 +41,9 @@ public sealed class DuplicateRemovalDialog : Window
         {
             var kept = group.Files.Where(file => !chosen.Contains(file.FullPath)).ToArray();
             valid &= kept.Length > 0;
-            lines.Add("SHA-256 : " + group.Hash);
-            lines.AddRange(group.Files.Where(file => chosen.Contains(file.FullPath)).Select(file => "RETIRER   " + file.FullPath));
-            lines.AddRange(kept.Select(file => "CONSERVER   " + file.FullPath));
+            lines.Add(L.T("SHA-256 : ", "SHA-256: ") + group.Hash);
+            lines.AddRange(group.Files.Where(file => chosen.Contains(file.FullPath)).Select(file => L.T("RETIRER   ", "REMOVE   ") + file.FullPath));
+            lines.AddRange(kept.Select(file => L.T("CONSERVER   ", "KEEP   ") + file.FullPath));
             lines.Add("");
         }
         var preview = new TextBox { IsReadOnly = true, Text = string.Join(Environment.NewLine, lines), TextWrapping = TextWrapping.Wrap, VerticalContentAlignment = VerticalAlignment.Top, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };

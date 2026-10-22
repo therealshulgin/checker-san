@@ -10,8 +10,8 @@ public sealed class DuplicateRowView(int groupNumber, DuplicateFile file) : INot
     public DuplicateFile File { get; } = file;
     public string RelativePath => File.RelativePath;
     public string SizeLabel => RowView.FormatSize(File.Size);
-    public string SelectionLabel => "Retirer " + File.RelativePath;
-    public string ActionLabel => IsSelected ? "À retirer" : "Conservé";
+    public string SelectionLabel => L.T("Retirer ", "Remove ") + File.RelativePath;
+    public string ActionLabel => IsSelected ? L.T("À retirer", "To remove") : L.T("Conservé", "Kept");
     public bool IsSelected
     {
         get => _isSelected;

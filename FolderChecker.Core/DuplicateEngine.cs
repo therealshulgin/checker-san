@@ -95,7 +95,7 @@ public sealed class DuplicateEngine
         private readonly HashSet<string> _warnings = new(StringComparer.Ordinal);
         private readonly List<DuplicateGroup> _groups = [];
         private readonly Stopwatch _saveTimer = Stopwatch.StartNew();
-        private string _root = "", _canonicalRoot = "", _phase = "Préparation", _currentPath = "";
+        private string _root = "", _canonicalRoot = "", _phase = L.T("Préparation", "Preparing"), _currentPath = "";
         private string? _checkpoint;
         private long _bytesRead, _filesScanned;
         private int _retryAttempt;
@@ -110,24 +110,24 @@ public sealed class DuplicateEngine
             try
             {
                 if (string.IsNullOrWhiteSpace(requestedRoot))
-                    throw new ArgumentException("Sélectionnez un dossier à analyser.", nameof(requestedRoot));
+                    throw new ArgumentException(L.T("Sélectionnez un dossier à analyser.", "Select a folder to scan."), nameof(requestedRoot));
                 _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(requestedRoot.Trim().Trim('"')));
                 await RetryAsync(() =>
                 {
                     if ((File.GetAttributes(_root) & FileAttributes.Directory) == 0)
-                        throw new ArgumentException("Le chemin sélectionné ne désigne pas un dossier.");
+                        throw new ArgumentException(L.T("Le chemin sélectionné ne désigne pas un dossier.", "The selected path is not a folder."));
                     _canonicalRoot = Canonical(_root);
                     return true;
                 }, _root);
                 PrepareCheckpoint();
-                SetPhase("Inventaire des fichiers");
+                SetPhase(L.T("Inventaire des fichiers", "Listing files"));
                 var initial = await InventoryAsync(true);
                 foreach (var sizeGroup in initial.Values.Where(item => !item.Directory
                              && (item.File.Attributes & FileAttributes.ReparsePoint) == 0)
                              .GroupBy(item => item.File.Size).Where(group => group.Count() > 1))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    SetPhase("Filtrage rapide des candidats");
+                    SetPhase(L.T("Filtrage rapide des candidats", "Quick candidate filtering"));
                     var candidates = new List<CacheEntry>();
                     var physicalFiles = new HashSet<string>(StringComparer.Ordinal);
                     foreach (var item in sizeGroup.OrderBy(item => item.File.RelativePath, StringComparer.OrdinalIgnoreCase))
@@ -137,14 +137,14 @@ public sealed class DuplicateEngine
                         var physical = PhysicalIdentity(sample.File.Identity);
                         if (physical is not null && !physicalFiles.Add(physical))
                         {
-                            _warnings.Add($"Lien physique écarté du calcul d’espace récupérable : {item.File.RelativePath}");
+                            _warnings.Add(L.F($"Lien physique écarté du calcul d’espace récupérable : {item.File.RelativePath}", $"Hard-linked file excluded from recoverable space: {item.File.RelativePath}"));
                             continue;
                         }
                         candidates.Add(sample);
                     }
                     foreach (var sampleGroup in candidates.GroupBy(item => item.Sample).Where(group => group.Count() > 1))
                     {
-                        SetPhase("Vérification SHA-256 complète");
+                        SetPhase(L.T("Vérification SHA-256 complète", "Complete SHA-256 verification"));
                         var hashed = new List<CacheEntry>();
                         foreach (var candidate in sampleGroup)
                         {
@@ -166,18 +166,18 @@ public sealed class DuplicateEngine
                     }
                 }
                 cancellationToken.ThrowIfCancellationRequested();
-                SetPhase("Contrôle final des modifications");
+                SetPhase(L.T("Contrôle final des modifications", "Final check for changes"));
                 var final = await InventoryAsync(false);
                 if (!string.Equals(_canonicalRoot, await RetryAsync(() => Canonical(_root), _root), StringComparison.OrdinalIgnoreCase))
-                    _errors.Add("La destination réelle du dossier a changé pendant le scan.");
+                    _errors.Add(L.T("La destination réelle du dossier a changé pendant le scan.", "The folder's physical location changed during the scan."));
                 if (initial.Count != final.Count)
-                    _errors.Add("Des fichiers ou dossiers ont été ajoutés ou retirés pendant le scan. Relancez-le.");
+                    _errors.Add(L.T("Des fichiers ou dossiers ont été ajoutés ou retirés pendant le scan. Relancez-le.", "Files or folders were added or removed during the scan. Scan again."));
                 foreach (var pair in initial)
                 {
                     if (!final.TryGetValue(pair.Key, out var last))
-                        _errors.Add($"Chemin retiré pendant le scan : {pair.Key}");
+                        _errors.Add(L.F($"Chemin retiré pendant le scan : {pair.Key}", $"Path removed during the scan: {pair.Key}"));
                     else if (pair.Value.Directory != last.Directory || !SameMetadata(pair.Value.File, last.File))
-                        _errors.Add($"Chemin modifié pendant le scan : {pair.Key}. Relancez la recherche.");
+                        _errors.Add(L.F($"Chemin modifié pendant le scan : {pair.Key}. Relancez la recherche.", $"Path changed during the scan: {pair.Key}. Run the search again."));
                 }
                 // The identity check also detects changes whose size and timestamps were restored.
                 foreach (var completed in _completed.Values)
@@ -187,22 +187,22 @@ public sealed class DuplicateEngine
                 }
                 cancellationToken.ThrowIfCancellationRequested();
                 verified = _errors.Count == 0;
-                SetPhase(verified ? "Recherche de doublons terminée" : "Recherche incomplète");
+                SetPhase(verified ? L.T("Recherche de doublons terminée", "Duplicate search completed") : L.T("Recherche incomplète", "Search incomplete"));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 cancelled = true;
-                SetPhase("Recherche arrêtée — progression conservée");
+                SetPhase(L.T("Recherche arrêtée — progression conservée", "Search stopped — progress saved"));
             }
             catch (Exception exception) when (FileSystemRetryPolicy.IsTransient(exception))
             {
-                _errors.Add($"Connexion indisponible après {options.MaxRetries} nouvelle(s) tentative(s) : {exception.Message}");
-                SetPhase("Connexion interrompue — reprise après reconnexion");
+                _errors.Add(L.F($"Connexion indisponible après {options.MaxRetries} nouvelle(s) tentative(s) : {exception.Message}", $"Connection unavailable after {options.MaxRetries} retries: {exception.Message}"));
+                SetPhase(L.T("Connexion interrompue — reprise après reconnexion", "Connection lost — resume after reconnecting"));
             }
             catch (Exception exception) when (IsFileError(exception))
             {
                 _errors.Add(exception.Message);
-                SetPhase("Recherche incomplète");
+                SetPhase(L.T("Recherche incomplète", "Search incomplete"));
             }
             finally
             {
@@ -238,7 +238,7 @@ public sealed class DuplicateEngine
                         var directoryAttributes = File.GetAttributes(directory);
                         if (!string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase)
                             && (directoryAttributes & FileAttributes.ReparsePoint) != 0)
-                            throw new IOException($"Le dossier est devenu un lien : {directory}");
+                            throw new IOException(L.F($"Le dossier est devenu un lien : {directory}", $"The folder has been replaced by a link: {directory}"));
                         foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
                         {
                             cancellationToken.ThrowIfCancellationRequested();
@@ -254,14 +254,14 @@ public sealed class DuplicateEngine
                                 entry.Refresh();
                                 attributes = File.GetAttributes(entry.FullName);
                                 if ((attributes & FileAttributes.Directory) == 0)
-                                    throw new IOException($"Le dossier a changé de type : {entry.FullName}");
+                                    throw new IOException(L.F($"Le dossier a changé de type : {entry.FullName}", $"The folder has changed type: {entry.FullName}"));
                             }
                             if (string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase)
                                 && isDirectory && string.Equals(entry.Name, DuplicateRemoval.QuarantineDirectoryName,
                                     StringComparison.OrdinalIgnoreCase)
                                 && DuplicateRemoval.IsManagedQuarantine(entry.FullName))
                             {
-                                _warnings.Add("La quarantaine Checker San est exclue de la recherche de doublons.");
+                                _warnings.Add(L.T("La quarantaine Checker San est exclue de la recherche de doublons.", "The Checker San quarantine is excluded from the duplicate search."));
                                 continue;
                             }
                             var file = new DuplicateFile
@@ -277,19 +277,19 @@ public sealed class DuplicateEngine
                 }
                 catch (Exception exception) when (IsFileError(exception) && !FileSystemRetryPolicy.IsTransient(exception))
                 {
-                    _errors.Add($"Inventaire impossible ({directory}) : {exception.Message}");
+                    _errors.Add(L.F($"Inventaire impossible ({directory}) : {exception.Message}", $"Unable to list files ({directory}): {exception.Message}"));
                     continue;
                 }
                 foreach (var item in batch)
                 {
                     if (!entries.TryAdd(item.File.RelativePath, item))
                     {
-                        _errors.Add($"Chemins ambigus, seule la casse diffère : {item.File.RelativePath}");
+                        _errors.Add(L.F($"Chemins ambigus, seule la casse diffère : {item.File.RelativePath}", $"Ambiguous paths differing only by case: {item.File.RelativePath}"));
                         continue;
                     }
                     if ((item.File.Attributes & FileAttributes.ReparsePoint) != 0)
                     {
-                        _errors.Add($"Lien ou point de réanalyse ignoré : {item.File.RelativePath}");
+                        _errors.Add(L.F($"Lien ou point de réanalyse ignoré : {item.File.RelativePath}", $"Link or reparse point skipped: {item.File.RelativePath}"));
                         continue;
                     }
                     if (item.Directory) pending.Push(item.File.FullPath);
@@ -309,7 +309,7 @@ public sealed class DuplicateEngine
             }
             catch (Exception exception) when (IsFileError(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
-                _errors.Add($"Lecture impossible ({file.RelativePath}) : {exception.Message}");
+                _errors.Add(L.F($"Lecture impossible ({file.RelativePath}) : {exception.Message}", $"Unable to read ({file.RelativePath}): {exception.Message}"));
                 return null;
             }
         }
@@ -323,15 +323,15 @@ public sealed class DuplicateEngine
             var current = Describe(expected, IdentityString(FileSafety.Identity(stream.SafeFileHandle)));
             if (!SameMetadata(expected, current) || stream.Length != expected.Size
                 || (expected.Identity is not null && expected.Identity != current.Identity))
-                throw new IOException("Le fichier a changé depuis son inventaire.");
+                throw new IOException(L.T("Le fichier a changé depuis son inventaire.", "The file has changed since it was listed."));
             var linkCount = HardLinkCount(stream.SafeFileHandle);
             if (linkCount > 1)
             {
-                _warnings.Add($"Lien physique écarté du calcul d’espace récupérable : {expected.RelativePath}");
+                _warnings.Add(L.F($"Lien physique écarté du calcul d’espace récupérable : {expected.RelativePath}", $"Hard-linked file excluded from recoverable space: {expected.RelativePath}"));
                 return null;
             }
             if (linkCount is null)
-                _warnings.Add("Le système ne fournit pas le nombre de liens physiques de certains fichiers : leur suppression automatique sera refusée.");
+                _warnings.Add(L.T("Le système ne fournit pas le nombre de liens physiques de certains fichiers : leur suppression automatique sera refusée.", "The system does not report the hard-link count for some files; automatic removal of those files will be refused."));
             CacheEntry? prior = null;
             if (_completed.TryGetValue(current.FullPath, out var inRun)) prior = inRun;
             else if (_cached.TryGetValue(current.FullPath, out var persisted)) prior = persisted;
@@ -348,7 +348,7 @@ public sealed class DuplicateEngine
             var digest = full || small ? ReadWhole(stream) : ReadSample(stream);
             var after = Describe(current, IdentityString(FileSafety.Identity(stream.SafeFileHandle)));
             if (!SameMetadata(current, after) || stream.Length != current.Size || current.Identity != after.Identity)
-                throw new IOException("Le fichier a changé pendant sa lecture.");
+                throw new IOException(L.T("Le fichier a changé pendant sa lecture.", "The file changed while it was being read."));
             var entry = new CacheEntry
             {
                 File = after,
@@ -356,7 +356,7 @@ public sealed class DuplicateEngine
                 Hash = full || small ? digest : null
             };
             // Full hashing follows a successful sample for every large candidate.
-            if (entry.Sample.Length != 64) throw new IOException("Échantillon du fichier indisponible.");
+            if (entry.Sample.Length != 64) throw new IOException(L.T("Échantillon du fichier indisponible.", "The file sample is unavailable."));
             _completed[current.FullPath] = entry;
             if (entry.Hash is not null) _fullyHashed.Add(current.FullPath);
             _checkpointDirty = true;
@@ -400,7 +400,7 @@ public sealed class DuplicateEngine
                     while (count < SampleLength)
                     {
                         var read = stream.Read(buffer, count, SampleLength - count);
-                        if (read == 0) throw new IOException("Fin de fichier inattendue pendant l’échantillonnage.");
+                        if (read == 0) throw new IOException(L.T("Fin de fichier inattendue pendant l’échantillonnage.", "Unexpected end of file while sampling."));
                         _bytesRead += read;
                         count += read;
                     }
@@ -423,26 +423,26 @@ public sealed class DuplicateEngine
                     var current = Describe(file, IdentityString(FileSafety.Identity(stream.SafeFileHandle)));
                     if (!SameMetadata(file, current) || stream.Length != file.Size
                         || (file.Identity is not null && file.Identity != current.Identity))
-                        throw new IOException("Le fichier a changé après sa vérification.");
+                        throw new IOException(L.T("Le fichier a changé après sa vérification.", "The file changed after verification."));
                     return true;
                 }, file.FullPath);
             }
             catch (Exception exception) when (IsFileError(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
-                _errors.Add($"Contrôle final impossible ({file.RelativePath}) : {exception.Message}");
+                _errors.Add(L.F($"Contrôle final impossible ({file.RelativePath}) : {exception.Message}", $"Final verification failed ({file.RelativePath}): {exception.Message}"));
             }
         }
 
         private void ValidatePath(string path)
         {
-            if (!FileSafety.IsWithin(_root, path)) throw new IOException("Fichier situé hors du dossier analysé.");
+            if (!FileSafety.IsWithin(_root, path)) throw new IOException(L.T("Fichier situé hors du dossier analysé.", "The file is outside the scanned folder."));
             var relative = Path.GetRelativePath(_root, path);
             var current = _root;
             foreach (var part in relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
             {
                 current = Path.Combine(current, part);
                 if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
-                    throw new IOException("Un lien ou point de réanalyse a remplacé le chemin.");
+                    throw new IOException(L.T("Un lien ou point de réanalyse a remplacé le chemin.", "The path has been replaced by a link or reparse point."));
             }
         }
 
@@ -451,7 +451,7 @@ public sealed class DuplicateEngine
             var info = new FileInfo(original.FullPath);
             var attributes = File.GetAttributes(original.FullPath);
             if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
-                throw new IOException("Le chemin ne désigne plus un fichier ordinaire.");
+                throw new IOException(L.T("Le chemin ne désigne plus un fichier ordinaire.", "The path no longer refers to a regular file."));
             return original with
             {
                 Size = info.Length, LastWriteUtc = info.LastWriteTimeUtc, CreationUtc = info.CreationTimeUtc,
@@ -471,7 +471,7 @@ public sealed class DuplicateEngine
                 _checkpoint = checkpoint;
                 if (!options.ResumeFromCheckpoint || !File.Exists(checkpoint)) return;
                 using var stream = new FileStream(checkpoint, FileMode.Open, FileAccess.Read, FileShare.Read);
-                if (stream.Length > 128L * 1024 * 1024) throw new JsonException("Session trop volumineuse.");
+                if (stream.Length > 128L * 1024 * 1024) throw new JsonException(L.T("Session trop volumineuse.", "The session file is too large."));
                 var cache = JsonSerializer.Deserialize<Cache>(stream);
                 if (cache is not { Schema: 1, Algorithm: "SHA256-SAMPLE64K-V1", Files: not null }
                     || !string.Equals(cache.Root, _root, StringComparison.OrdinalIgnoreCase)
@@ -490,23 +490,23 @@ public sealed class DuplicateEngine
             }
             catch (Exception exception) when (IsFileError(exception) || exception is JsonException or ArgumentException)
             {
-                _warnings.Add($"Session de reprise non disponible : {exception.Message}");
+                _warnings.Add(L.F($"Session de reprise non disponible : {exception.Message}", $"Resume session unavailable: {exception.Message}"));
             }
         }
 
         private void ValidateCheckpoint(string path)
         {
             if (FileSafety.IsWithin(_root, path) || FileSafety.IsWithin(_canonicalRoot, path))
-                throw new ArgumentException("La session de reprise doit être enregistrée hors du dossier analysé.");
+                throw new ArgumentException(L.T("La session de reprise doit être enregistrée hors du dossier analysé.", "The resume session must be saved outside the scanned folder."));
             var parent = Path.GetDirectoryName(path)!;
             var existing = parent;
             while (!Directory.Exists(existing))
-                existing = Path.GetDirectoryName(existing) ?? throw new ArgumentException("Dossier de session invalide.");
+                existing = Path.GetDirectoryName(existing) ?? throw new ArgumentException(L.T("Dossier de session invalide.", "Invalid session folder."));
             var canonicalParent = Path.GetFullPath(Path.Combine(Canonical(existing), Path.GetRelativePath(existing, parent)));
             if (FileSafety.IsWithin(_canonicalRoot, Path.Combine(canonicalParent, Path.GetFileName(path))))
-                throw new ArgumentException("Un lien redirige la session de reprise dans le dossier analysé.");
+                throw new ArgumentException(L.T("Un lien redirige la session de reprise dans le dossier analysé.", "A link redirects the resume session into the scanned folder."));
             if (File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
-                throw new ArgumentException("La session de reprise ne peut pas être un lien.");
+                throw new ArgumentException(L.T("La session de reprise ne peut pas être un lien.", "The resume session cannot be a link."));
         }
 
         private bool SaveCheckpoint(bool force)
@@ -536,7 +536,7 @@ public sealed class DuplicateEngine
             }
             catch (Exception exception) when (IsFileError(exception) || exception is ArgumentException)
             {
-                _warnings.Add($"Progression non enregistrée : {exception.Message}");
+                _warnings.Add(L.F($"Progression non enregistrée : {exception.Message}", $"Progress was not saved: {exception.Message}"));
                 return false;
             }
             finally
@@ -555,7 +555,7 @@ public sealed class DuplicateEngine
                     options.MaxRetries, options.InitialRetryDelayMs, (attempt, delay) =>
                     {
                         _retryAttempt = attempt;
-                        _phase = $"Connexion interrompue — tentative {attempt}/{options.MaxRetries} dans {delay.TotalSeconds:0.#} s";
+                        _phase = L.F($"Connexion interrompue — tentative {attempt}/{options.MaxRetries} dans {delay.TotalSeconds:0.#} s", $"Connection lost — retry {attempt}/{options.MaxRetries} in {delay.TotalSeconds:0.#} s");
                         _currentPath = path;
                         Report();
                     }, cancellationToken);

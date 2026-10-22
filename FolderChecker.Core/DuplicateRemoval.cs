@@ -97,11 +97,11 @@ public sealed class DuplicateRemoval
         {
             token.ThrowIfCancellationRequested();
             if (!OperatingSystem.IsWindows())
-                throw new PlatformNotSupportedException("Cette opération nécessite Windows.");
+                throw new PlatformNotSupportedException(L.T("Cette opération nécessite Windows.", "This operation requires Windows."));
             if (mode is not DuplicateRemovalMode.Quarantine and not DuplicateRemovalMode.Permanent)
-                throw new InvalidOperationException("Mode de suppression inconnu.");
+                throw new InvalidOperationException(L.T("Mode de suppression inconnu.", "Unknown removal mode."));
             if (scan.Cancelled || !scan.SnapshotVerified || scan.Errors.Count != 0)
-                throw new InvalidOperationException("Une recherche de doublons complète et vérifiée est nécessaire.");
+                throw new InvalidOperationException(L.T("Une recherche de doublons complète et vérifiée est nécessaire.", "A complete and verified duplicate search is required."));
             var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(scan.Root));
             var plan = BuildPlan(scan, root, selectedPaths);
             if (plan.Count == 0)
@@ -109,7 +109,7 @@ public sealed class DuplicateRemoval
             using var directories = new DirectoryLocks(root);
             var canonicalRoot = FileSafety.CanonicalDirectory(root);
             if (!string.Equals(canonicalRoot, scan.CanonicalRoot, StringComparison.OrdinalIgnoreCase))
-                throw new IOException("Le dossier analysé a changé de destination. Relancez la recherche.");
+                throw new IOException(L.T("Le dossier analysé a changé de destination. Relancez la recherche.", "The scanned folder's physical location has changed. Run the search again."));
 
             foreach (var group in plan)
             {
@@ -120,7 +120,7 @@ public sealed class DuplicateRemoval
                 {
                     directories.PinParent(group.Keeper.FullPath);
                     using var keeper = OpenVerified(group.Keeper, group.Hash, false, canonicalRoot, token,
-                        count => { bytesVerified += count; Report("Vérification de la copie conservée", group.Keeper.FullPath); });
+                        count => { bytesVerified += count; Report(L.T("Vérification de la copie conservée", "Verifying the copy to keep"), group.Keeper.FullPath); });
                     var identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                         { PhysicalIdentity(FileSafety.Identity(keeper.SafeFileHandle)!) };
                     foreach (var file in group.Selected)
@@ -128,10 +128,10 @@ public sealed class DuplicateRemoval
                         token.ThrowIfCancellationRequested();
                         directories.PinParent(file.FullPath);
                         var stream = OpenVerified(file, group.Hash, true, canonicalRoot, token,
-                            count => { bytesVerified += count; Report("Vérification avant suppression", file.FullPath); });
+                            count => { bytesVerified += count; Report(L.T("Vérification avant suppression", "Verifying before removal"), file.FullPath); });
                         opened.Add((file, stream));
                         if (!identities.Add(PhysicalIdentity(FileSafety.Identity(stream.SafeFileHandle)!)))
-                            throw new IOException("Plusieurs chemins désignent le même fichier physique. Aucun fichier de ce groupe n’a été supprimé.");
+                            throw new IOException(L.T("Plusieurs chemins désignent le même fichier physique. Aucun fichier de ce groupe n’a été supprimé.", "Several paths refer to the same physical file. No file in this group has been removed."));
                     }
                     token.ThrowIfCancellationRequested();
                     foreach (var item in opened)
@@ -151,12 +151,12 @@ public sealed class DuplicateRemoval
                         {
                             byte remove = 1;
                             if (!SetFileInformationByHandle(item.Stream.SafeFileHandle, 4, ref remove, 1))
-                                throw new Win32Exception(Marshal.GetLastWin32Error(), "Windows a refusé la suppression du fichier vérifié.");
+                                throw new Win32Exception(Marshal.GetLastWin32Error(), L.T("Windows a refusé la suppression du fichier vérifié.", "Windows refused to delete the verified file."));
                             item.Stream.Dispose();
                             bytesRemoved += item.File.Size;
                         }
                         completed.Add(item.File.FullPath);
-                        Report(mode == DuplicateRemovalMode.Quarantine ? "Doublon mis à l’écart" : "Doublon supprimé",
+                        Report(mode == DuplicateRemovalMode.Quarantine ? L.T("Doublon mis à l’écart", "Duplicate quarantined") : L.T("Doublon supprimé", "Duplicate deleted"),
                             item.File.FullPath);
                     }
                 }
@@ -185,29 +185,29 @@ public sealed class DuplicateRemoval
         foreach (var selected in selectedPaths)
         {
             if (!Path.IsPathFullyQualified(selected) || !selection.Add(Path.GetFullPath(selected)))
-                throw new InvalidOperationException("La sélection contient un chemin invalide ou répété.");
+                throw new InvalidOperationException(L.T("La sélection contient un chemin invalide ou répété.", "The selection contains an invalid or repeated path."));
         }
         var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var groups = new List<RemovalGroup>();
         foreach (var group in scan.Groups)
         {
             if (group.Hash.Length != 64 || !group.Hash.All(Uri.IsHexDigit) || group.Files.Count < 2)
-                throw new InvalidOperationException("Un groupe de doublons est invalide.");
+                throw new InvalidOperationException(L.T("Un groupe de doublons est invalide.", "A duplicate group is invalid."));
             foreach (var file in group.Files)
             {
                 ValidatePath(root, file);
                 if (file.Size != group.Size || !known.Add(Path.GetFullPath(file.FullPath)))
-                    throw new InvalidOperationException("Un fichier apparaît dans plusieurs groupes ou possède une taille incohérente.");
+                    throw new InvalidOperationException(L.T("Un fichier apparaît dans plusieurs groupes ou possède une taille incohérente.", "A file appears in multiple groups or has an inconsistent size."));
             }
             var selected = group.Files.Where(file => selection.Contains(Path.GetFullPath(file.FullPath))).ToList();
             if (selected.Count == 0) continue;
             var keeper = group.Files.FirstOrDefault(file => !selection.Contains(Path.GetFullPath(file.FullPath)));
             if (keeper is null)
-                throw new InvalidOperationException("Conservez au moins un fichier de chaque groupe de doublons.");
+                throw new InvalidOperationException(L.T("Conservez au moins un fichier de chaque groupe de doublons.", "Keep at least one file in each duplicate group."));
             groups.Add(new RemovalGroup(group.Hash, keeper, selected));
         }
         if (selection.Any(path => !known.Contains(path)))
-            throw new InvalidOperationException("La sélection contient un fichier absent des doublons vérifiés.");
+            throw new InvalidOperationException(L.T("La sélection contient un fichier absent des doublons vérifiés.", "The selection contains a file that is not among the verified duplicates."));
         return groups;
     }
 
@@ -220,7 +220,7 @@ public sealed class DuplicateRemoval
             !string.Equals(Path.GetFullPath(Path.Combine(root, file.RelativePath)), Path.GetFullPath(file.FullPath),
                 StringComparison.OrdinalIgnoreCase) ||
             string.Equals(file.RelativePath.Split(['/', '\\'])[0], QuarantineDirectoryName, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Le chemin d’un doublon est invalide ou sort du dossier analysé.");
+            throw new InvalidOperationException(L.T("Le chemin d’un doublon est invalide ou sort du dossier analysé.", "A duplicate's path is invalid or outside the scanned folder."));
     }
 
     private static FileStream OpenVerified(DuplicateFile file, string hash, bool forRemoval,
@@ -232,7 +232,7 @@ public sealed class DuplicateRemoval
         {
             var error = Marshal.GetLastWin32Error();
             handle.Dispose();
-            throw new Win32Exception(error, $"Impossible de verrouiller « {file.RelativePath} ».");
+            throw new Win32Exception(error, L.F($"Impossible de verrouiller « {file.RelativePath} ».", $"Unable to lock ‘{file.RelativePath}’."));
         }
         FileStream? stream = null;
         try
@@ -242,15 +242,15 @@ public sealed class DuplicateRemoval
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             var identity = FileSafety.Identity(handle);
             if (DuplicateEngine.HardLinkCount(handle) != 1)
-                throw new IOException($"« {file.RelativePath} » possède des liens physiques, ou leur nombre ne peut pas être vérifié. Aucun fichier de ce groupe ne sera supprimé.");
+                throw new IOException(L.F($"« {file.RelativePath} » possède des liens physiques, ou leur nombre ne peut pas être vérifié. Aucun fichier de ce groupe ne sera supprimé.", $"‘{file.RelativePath}’ has hard links, or their count cannot be verified. No file in this group will be removed."));
             if (((FileAttributes)info.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
                 length != file.Size || DateTime.FromFileTimeUtc(info.LastWriteTime) != file.LastWriteUtc ||
                 DateTime.FromFileTimeUtc(info.CreationTime) != file.CreationUtc ||
                 (FileAttributes)info.Attributes != file.Attributes || !SameIdentity(identity, file.Identity))
-                throw new IOException($"« {file.RelativePath} » a changé depuis le scan, ou son identité ne peut pas être vérifiée.");
+                throw new IOException(L.F($"« {file.RelativePath} » a changé depuis le scan, ou son identité ne peut pas être vérifiée.", $"‘{file.RelativePath}’ has changed since the scan, or its identity cannot be verified."));
             var canonicalFile = FinalPath(handle);
             if (!string.Equals(canonicalFile, Path.Combine(canonicalRoot, file.RelativePath), StringComparison.OrdinalIgnoreCase))
-                throw new IOException($"Le chemin de « {file.RelativePath} » a changé de destination.");
+                throw new IOException(L.F($"Le chemin de « {file.RelativePath} » a changé de destination.", $"The physical location of ‘{file.RelativePath}’ has changed."));
             stream = new FileStream(handle, FileAccess.Read, 1, false);
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             var buffer = ArrayPool<byte>.Shared.Rent(1024 * 1024);
@@ -268,7 +268,7 @@ public sealed class DuplicateRemoval
             finally { ArrayPool<byte>.Shared.Return(buffer); }
             token.ThrowIfCancellationRequested();
             if (!string.Equals(Convert.ToHexString(digest.GetHashAndReset()), hash, StringComparison.OrdinalIgnoreCase))
-                throw new IOException($"Le contenu de « {file.RelativePath} » a changé. Aucun autre fichier de ce groupe ne sera supprimé.");
+                throw new IOException(L.F($"Le contenu de « {file.RelativePath} » a changé. Aucun autre fichier de ce groupe ne sera supprimé.", $"The contents of ‘{file.RelativePath}’ have changed. No other file in this group will be removed."));
             return stream;
         }
         catch
@@ -299,12 +299,12 @@ public sealed class DuplicateRemoval
         {
             directories.Pin(quarantine);
             if (!IsManagedQuarantine(quarantine))
-                throw new IOException($"Le dossier « {QuarantineDirectoryName} » existe déjà et n’est pas une quarantaine Checker San.");
+                throw new IOException(L.F($"Le dossier « {QuarantineDirectoryName} » existe déjà et n’est pas une quarantaine Checker San.", $"The folder ‘{QuarantineDirectoryName}’ already exists and is not a Checker San quarantine."));
         }
         else
         {
             if (!CreateDirectoryW(quarantine, IntPtr.Zero))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Impossible de créer une quarantaine réservée à Checker San.");
+                throw new Win32Exception(Marshal.GetLastWin32Error(), L.T("Impossible de créer une quarantaine réservée à Checker San.", "Unable to create a quarantine reserved for Checker San."));
             directories.Pin(quarantine);
             using var marker = new FileStream(Path.Combine(quarantine, MarkerName), FileMode.CreateNew, FileAccess.Write, FileShare.None);
             JsonSerializer.Serialize(marker, new QuarantineMarker
@@ -313,7 +313,7 @@ public sealed class DuplicateRemoval
         }
         var session = Path.Combine(quarantine, Guid.NewGuid().ToString("N"));
         if (!CreateDirectoryW(session, IntPtr.Zero))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Impossible de créer une session de quarantaine.");
+            throw new Win32Exception(Marshal.GetLastWin32Error(), L.T("Impossible de créer une session de quarantaine.", "Unable to create a quarantine session."));
         directories.Pin(session);
         return session;
     }
@@ -340,7 +340,7 @@ public sealed class DuplicateRemoval
             if (status != 0)
             {
                 var error = unchecked((int)RtlNtStatusToDosError(status));
-                throw new Win32Exception(error, $"Windows a refusé la mise à l’écart (code {error}) ; aucune suppression définitive n’a été tentée.");
+                throw new Win32Exception(error, L.F($"Windows a refusé la mise à l’écart (code {error}) ; aucune suppression définitive n’a été tentée.", $"Windows refused to quarantine the file (code {error}); permanent deletion was not attempted."));
             }
             GC.KeepAlive(destinationDirectory);
         }
@@ -376,7 +376,7 @@ public sealed class DuplicateRemoval
         internal SafeFileHandle Pin(string directory)
         {
             directory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
-            if (!FileSafety.IsWithin(_root, directory)) throw new IOException("Le dossier sort de la racine analysée.");
+            if (!FileSafety.IsWithin(_root, directory)) throw new IOException(L.T("Le dossier sort de la racine analysée.", "The folder is outside the scanned root."));
             if (_handles.TryGetValue(directory, out var existing)) return existing;
             if (!string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase))
                 Pin(Path.GetDirectoryName(directory)!);
@@ -386,14 +386,14 @@ public sealed class DuplicateRemoval
             {
                 var error = Marshal.GetLastWin32Error();
                 handle.Dispose();
-                throw new Win32Exception(error, $"Impossible de verrouiller le dossier « {directory} ».");
+                throw new Win32Exception(error, L.F($"Impossible de verrouiller le dossier « {directory} ».", $"Unable to lock folder ‘{directory}’."));
             }
             if (!GetFileInformationByHandleEx(handle, 0, out BasicInfo info, (uint)Marshal.SizeOf<BasicInfo>()) ||
                 ((FileAttributes)info.Attributes & FileAttributes.Directory) == 0 ||
                 ((FileAttributes)info.Attributes & FileAttributes.ReparsePoint) != 0)
             {
                 handle.Dispose();
-                throw new IOException("Une jonction ou un lien ne peut pas être utilisé pour supprimer des doublons.");
+                throw new IOException(L.T("Une jonction ou un lien ne peut pas être utilisé pour supprimer des doublons.", "A junction or link cannot be used to remove duplicates."));
             }
             _handles.Add(directory, handle);
             return handle;

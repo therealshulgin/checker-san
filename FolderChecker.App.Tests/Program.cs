@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -18,6 +18,9 @@ internal static partial class Program
 {
     private static readonly (string Name, Action Run)[] Tests =
     [
+        ("Language switching preserves results, paths, filters and selection", MainLanguagePreservesResults),
+        ("Language switching is disabled during operations", MainLanguageDisabledWhileBusy),
+        ("Language switching preserves invalidated verdicts", MainLanguageKeepsInvalidatedVerdict),
         ("CSV preserves every result, error, hash and report verdict", CsvCompleteness),
         ("CSV neutralizes spreadsheet formulas and retains quoted multiline text", CsvEscaping),
         ("JSON retains the complete comparison model without CSV escaping", JsonCompleteness),
@@ -50,8 +53,10 @@ internal static partial class Program
     {
         var application = new FolderChecker.App.App();
         application.InitializeComponent();
+        AppLanguage.Apply("fr", persist: false);
         application.ShutdownMode = ShutdownMode.OnExplicitShutdown;
         SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
+        if (args is ["--render-en", var englishDirectory]) { AppLanguage.Apply("en", persist: false); RenderPreviews(englishDirectory); return 0; }
         if (args is ["--render", var directory]) { RenderPreviews(directory); return 0; }
         var failures = 0;
         var timer = Stopwatch.StartNew();

@@ -57,7 +57,7 @@ public sealed class ComparisonEngine
         private string? _checkpointPath;
         private string _sourceRoot = "", _targetRoot = "", _sourceCanonical = "", _targetCanonical = "";
         private bool _hasCheckpoint, _checkpointSaved, _checkpointDirty;
-        private string _phase = "Préparation";
+        private string _phase = L.T("Préparation", "Preparing");
         private string _currentPath = "";
 
         public async Task<ComparisonResult> ExecuteAsync()
@@ -73,20 +73,20 @@ public sealed class ComparisonEngine
 
             try
             {
-                sourceRoot = await RetryIoAsync(() => NormalizeRoot(source, "dossier 1"), source);
-                targetRoot = await RetryIoAsync(() => NormalizeRoot(target, "dossier 2"), target);
+                sourceRoot = await RetryIoAsync(() => NormalizeRoot(source, L.T("dossier 1", "folder 1")), source);
+                targetRoot = await RetryIoAsync(() => NormalizeRoot(target, L.T("dossier 2", "folder 2")), target);
                 sourceSnapshot = new Snapshot(sourceRoot);
                 targetSnapshot = new Snapshot(targetRoot);
                 await RetryIoAsync(() => { ValidateSeparateRoots(sourceRoot, targetRoot); return true; }, sourceRoot);
                 await PrepareCheckpointAsync(sourceRoot, targetRoot);
-                SetPhase("Inventaire du dossier 1");
+                SetPhase(L.T("Inventaire du dossier 1", "Listing folder 1"));
                 await ScanAsync(sourceSnapshot, true);
-                SetPhase("Inventaire du dossier 2");
+                SetPhase(L.T("Inventaire du dossier 2", "Listing folder 2"));
                 await ScanAsync(targetSnapshot, true);
                 scansComplete = true;
                 BuildInitialRows(sourceSnapshot, targetSnapshot);
                 PlanHashBytes(sourceSnapshot, targetSnapshot);
-                SetPhase("Vérification SHA-256 des fichiers correspondants");
+                SetPhase(L.T("Vérification SHA-256 des fichiers correspondants", "Verifying matching files with SHA-256"));
 
                 foreach (var item in sourceSnapshot.Entries.Values)
                 {
@@ -108,7 +108,7 @@ public sealed class ComparisonEngine
                             _rows[item.RelativePath] = _rows[item.RelativePath] with
                             {
                                 Status = ComparisonStatus.Unverified,
-                                Detail = "Présélection impossible : consultez les erreurs."
+                                Detail = L.T("Présélection impossible : consultez les erreurs.", "Candidate filtering failed: see the errors.")
                             };
                             continue;
                         }
@@ -117,7 +117,7 @@ public sealed class ComparisonEngine
                             _rows[item.RelativePath] = _rows[item.RelativePath] with
                             {
                                 Status = ComparisonStatus.Different,
-                                Detail = "Même chemin et même taille, mais des octets diffèrent dans les échantillons lus."
+                                Detail = L.T("Même chemin et même taille, mais des octets diffèrent dans les échantillons lus.", "Same path and size, but the sampled bytes differ.")
                             };
                             continue;
                         }
@@ -130,9 +130,9 @@ public sealed class ComparisonEngine
                     _rows[item.RelativePath] = _rows[item.RelativePath] with
                     {
                         Status = !valid ? ComparisonStatus.Unverified : identical ? ComparisonStatus.Identical : ComparisonStatus.Different,
-                        Detail = !valid ? "Vérification impossible : consultez les erreurs." : identical
-                            ? "Même chemin et contenu identique (SHA-256 complet)."
-                            : "Même chemin et même taille, mais contenu différent (SHA-256).",
+                        Detail = !valid ? L.T("Vérification impossible : consultez les erreurs.", "Verification failed: see the errors.") : identical
+                            ? L.T("Même chemin et contenu identique (SHA-256 complet).", "Same path and identical contents (complete SHA-256).")
+                            : L.T("Même chemin et même taille, mais contenu différent (SHA-256).", "Same path and size, but different contents (SHA-256)."),
                         SourceHash = sourceHash,
                         TargetHash = targetHash
                     };
@@ -143,7 +143,7 @@ public sealed class ComparisonEngine
                     await FindMovedFilesAsync(sourceSnapshot, targetSnapshot);
 
                 cancellationToken.ThrowIfCancellationRequested();
-                SetPhase("Contrôle final des modifications");
+                SetPhase(L.T("Contrôle final des modifications", "Final check for changes"));
                 var finalSource = new Snapshot(sourceRoot);
                 var finalTarget = new Snapshot(targetRoot);
                 await ScanAsync(finalSource, false);
@@ -152,7 +152,7 @@ public sealed class ComparisonEngine
                 var targetStable = VerifySnapshot(targetSnapshot, finalTarget, false);
                 snapshotVerified = sourceStable && targetStable && _errors.Count == 0;
                 cancellationToken.ThrowIfCancellationRequested();
-                SetPhase("Comparaison terminée");
+                SetPhase(L.T("Comparaison terminée", "Comparison completed"));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -161,19 +161,19 @@ public sealed class ComparisonEngine
                 {
                     BuildInitialRows(sourceSnapshot, targetSnapshot);
                     foreach (var key in _rows.Keys.ToArray())
-                        _rows[key] = _rows[key] with { Status = ComparisonStatus.Unverified, Detail = "Inventaire interrompu : présence non confirmée." };
+                        _rows[key] = _rows[key] with { Status = ComparisonStatus.Unverified, Detail = L.T("Inventaire interrompu : présence non confirmée.", "Listing interrupted: presence has not been confirmed.") };
                 }
-                SetPhase("Comparaison annulée");
+                SetPhase(L.T("Comparaison annulée", "Comparison cancelled"));
             }
             catch (Exception exception) when (FileSystemRetryPolicy.IsTransient(exception))
             {
-                var problem = $"Connexion indisponible après {options.MaxRetries} nouvelle(s) tentative(s) : {exception.Message} Reprenez la comparaison lorsque le dossier est de nouveau accessible.";
+                var problem = L.F($"Connexion indisponible après {options.MaxRetries} nouvelle(s) tentative(s) : {exception.Message} Reprenez la comparaison lorsque le dossier est de nouveau accessible.", $"Connection unavailable after {options.MaxRetries} retries: {exception.Message} Resume the comparison when the folder is accessible again.");
                 _errors.Add(problem);
                 if (!scansComplete) BuildInitialRows(sourceSnapshot, targetSnapshot);
                 foreach (var key in _rows.Keys.ToArray())
                     if (!scansComplete || _rows[key].Status == ComparisonStatus.Unverified)
                         _rows[key] = _rows[key] with { Status = ComparisonStatus.Unverified, Detail = problem };
-                SetPhase("Connexion interrompue — reprise disponible après reconnexion");
+                SetPhase(L.T("Connexion interrompue — reprise disponible après reconnexion", "Connection lost — resume after reconnecting"));
             }
             finally
             {
@@ -229,7 +229,7 @@ public sealed class ComparisonEngine
                     (attempt, delay) =>
                     {
                         _retryAttempt = attempt;
-                        _phase = $"Connexion interrompue — tentative {attempt}/{options.MaxRetries} dans {delay.TotalSeconds:0.#} s";
+                        _phase = L.F($"Connexion interrompue — tentative {attempt}/{options.MaxRetries} dans {delay.TotalSeconds:0.#} s", $"Connection lost — retry {attempt}/{options.MaxRetries} in {delay.TotalSeconds:0.#} s");
                         _currentPath = path;
                         ReportProgress(true);
                     }, cancellationToken);
@@ -258,7 +258,7 @@ public sealed class ComparisonEngine
             }
             catch (Exception exception) when (IsFileSystemException(exception))
             {
-                _warnings.Add($"La session de reprise ne peut pas être enregistrée : {exception.Message}");
+                _warnings.Add(L.F($"La session de reprise ne peut pas être enregistrée : {exception.Message}", $"The resume session could not be saved: {exception.Message}"));
                 return;
             }
             _checkpointPath = path;
@@ -266,7 +266,7 @@ public sealed class ComparisonEngine
             var data = CheckpointData.Read(path);
             if (data is null)
             {
-                if (File.Exists(path)) _warnings.Add("Le fichier de reprise est illisible ou invalide. Les fichiers seront vérifiés à nouveau.");
+                if (File.Exists(path)) _warnings.Add(L.T("Le fichier de reprise est illisible ou invalide. Les fichiers seront vérifiés à nouveau.", "The resume file is unreadable or invalid. Files will be verified again."));
                 return;
             }
             if (!string.Equals(data.SourceRoot, sourceRoot, StringComparison.OrdinalIgnoreCase) ||
@@ -275,7 +275,7 @@ public sealed class ComparisonEngine
                 !string.Equals(data.TargetCanonicalRoot, _targetCanonical, StringComparison.OrdinalIgnoreCase) ||
                 data.FindMovedFiles != options.FindMovedFiles)
             {
-                _warnings.Add("La session enregistrée concerne d’autres dossiers ou options. Une nouvelle comparaison a été démarrée.");
+                _warnings.Add(L.T("La session enregistrée concerne d’autres dossiers ou options. Une nouvelle comparaison a été démarrée.", "The saved session uses different folders or options. A new comparison has been started."));
                 return;
             }
             foreach (var file in data.Files)
@@ -290,31 +290,31 @@ public sealed class ComparisonEngine
         private void ValidateCheckpointPath(string path)
         {
             if (IsWithin(_sourceRoot, path) || IsWithin(_targetRoot, path))
-                throw new ArgumentException("Le fichier de reprise doit être enregistré hors des deux dossiers comparés.", nameof(options.CheckpointPath));
-            var parent = Path.GetDirectoryName(path) ?? throw new ArgumentException("Chemin de reprise invalide.");
+                throw new ArgumentException(L.T("Le fichier de reprise doit être enregistré hors des deux dossiers comparés.", "The resume file must be saved outside both compared folders."), nameof(options.CheckpointPath));
+            var parent = Path.GetDirectoryName(path) ?? throw new ArgumentException(L.T("Chemin de reprise invalide.", "Invalid resume path."));
             var ancestor = parent;
             while (true)
             {
                 try
                 {
                     if ((File.GetAttributes(ancestor) & FileAttributes.Directory) == 0)
-                        throw new ArgumentException("Le parent du fichier de reprise n’est pas un dossier.");
+                        throw new ArgumentException(L.T("Le parent du fichier de reprise n’est pas un dossier.", "The parent of the resume file is not a folder."));
                     break;
                 }
                 catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
                 {
-                    ancestor = Path.GetDirectoryName(ancestor) ?? throw new ArgumentException("Le dossier de reprise n’est pas accessible.");
+                    ancestor = Path.GetDirectoryName(ancestor) ?? throw new ArgumentException(L.T("Le dossier de reprise n’est pas accessible.", "The resume folder is inaccessible."));
                 }
             }
             var canonicalParent = Path.GetFullPath(Path.Combine(CanonicalRoot(ancestor), Path.GetRelativePath(ancestor, parent)));
             var canonicalPath = Path.Combine(canonicalParent, Path.GetFileName(path));
             if (IsWithin(_sourceCanonical, canonicalPath) || IsWithin(_targetCanonical, canonicalPath))
-                throw new ArgumentException("Le fichier de reprise pointe vers un des dossiers comparés via un lien ou une jonction.", nameof(options.CheckpointPath));
+                throw new ArgumentException(L.T("Le fichier de reprise pointe vers un des dossiers comparés via un lien ou une jonction.", "The resume file points inside a compared folder through a link or junction."), nameof(options.CheckpointPath));
             try
             {
                 var attributes = File.GetAttributes(path);
                 if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
-                    throw new ArgumentException("Le fichier de reprise ne doit pas être un lien, une jonction ou un dossier.");
+                    throw new ArgumentException(L.T("Le fichier de reprise ne doit pas être un lien, une jonction ou un dossier.", "The resume file must not be a link, junction or folder."));
             }
             catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException) { }
         }
@@ -350,7 +350,7 @@ public sealed class ComparisonEngine
             }
             catch (Exception exception) when (IsFileSystemException(exception) || exception is ArgumentException or JsonException)
             {
-                _warnings.Add($"Enregistrement de la reprise impossible : {exception.Message}");
+                _warnings.Add(L.F($"Enregistrement de la reprise impossible : {exception.Message}", $"Unable to save resume data: {exception.Message}"));
                 return false;
             }
             finally
@@ -384,7 +384,7 @@ public sealed class ComparisonEngine
             }
             catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
-                var problem = $"Impossible de lire la racine « {snapshot.Root} » : {exception.Message}";
+                var problem = L.F($"Impossible de lire la racine « {snapshot.Root} » : {exception.Message}", $"Unable to read root ‘{snapshot.Root}’: {exception.Message}");
                 _errors.Add(problem);
                 if (snapshot.RootEntry is not null) snapshot.RootEntry = snapshot.RootEntry with { Problem = problem };
                 return;
@@ -404,7 +404,7 @@ public sealed class ComparisonEngine
                     var batch = await RetryIoAsync(() => ReadDirectoryBatch(snapshot.Root, directory), directory);
                     if (batch is null)
                     {
-                        MarkDirectoryProblem(snapshot, directory, "Lien symbolique ou point de jonction ignoré.");
+                        MarkDirectoryProblem(snapshot, directory, L.T("Lien symbolique ou point de jonction ignoré.", "Symbolic link or junction skipped."));
                         continue;
                     }
                     foreach (var entry in batch)
@@ -413,7 +413,7 @@ public sealed class ComparisonEngine
                         var relative = entry.RelativePath;
                         if (snapshot.Entries.TryGetValue(relative, out var collision))
                         {
-                            var problem = $"Chemins ambigus, distincts seulement par la casse : « {collision.FullPath} » et « {entry.FullPath} ».";
+                            var problem = L.F($"Chemins ambigus, distincts seulement par la casse : « {collision.FullPath} » et « {entry.FullPath} ».", $"Ambiguous paths differing only by case: ‘{collision.FullPath}’ and ‘{entry.FullPath}’.");
                             _errors.Add(problem);
                             snapshot.Entries[relative] = collision with { Problem = problem };
                             continue;
@@ -430,7 +430,7 @@ public sealed class ComparisonEngine
                 }
                 catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
                 {
-                    MarkDirectoryProblem(snapshot, directory, $"Dossier non entièrement lisible : {exception.Message}");
+                    MarkDirectoryProblem(snapshot, directory, L.F($"Dossier non entièrement lisible : {exception.Message}", $"The folder could not be read completely: {exception.Message}"));
                 }
             }
         }
@@ -455,7 +455,7 @@ public sealed class ComparisonEngine
                 catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
                 {
                     result.Add(new Entry(relative, info.FullName, info is DirectoryInfo ? EntryKind.Directory : EntryKind.File,
-                        null, default, default, 0, $"Impossible de lire « {info.FullName} » : {exception.Message}"));
+                        null, default, default, 0, L.F($"Impossible de lire « {info.FullName} » : {exception.Message}", $"Unable to read ‘{info.FullName}’: {exception.Message}")));
                 }
                 ReportProgress();
             }
@@ -474,14 +474,14 @@ public sealed class ComparisonEngine
             // and handle checks to validate current metadata before/after content access.
             var attributes = info.Attributes;
             if (attributes == (FileAttributes)(-1))
-                throw new IOException("Les attributs de l’élément énuméré sont indisponibles.");
+                throw new IOException(L.T("Les attributs de l’élément énuméré sont indisponibles.", "The listed item's attributes are unavailable."));
             var kind = (attributes & FileAttributes.Directory) != 0 ? EntryKind.Directory : EntryKind.File;
             var problem = (attributes & FileAttributes.ReparsePoint) != 0
-                ? $"Lien symbolique, jonction ou fichier à réanalyse ignoré : « {info.FullName} »." : null;
+                ? L.F($"Lien symbolique, jonction ou fichier à réanalyse ignoré : « {info.FullName} ».", $"Symbolic link, junction or reparse file skipped: ‘{info.FullName}’.") : null;
             long? size = null;
             if (kind == EntryKind.File && problem is null)
                 size = info is FileInfo file ? file.Length
-                    : throw new IOException("Le type de l’élément énuméré est incohérent.");
+                    : throw new IOException(L.T("Le type de l’élément énuméré est incohérent.", "The listed item has an inconsistent type."));
             return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, problem);
         }
 
@@ -492,14 +492,14 @@ public sealed class ComparisonEngine
             var attributes = File.GetAttributes(info.FullName);
             var kind = (attributes & FileAttributes.Directory) != 0 ? EntryKind.Directory : EntryKind.File;
             var problem = (attributes & FileAttributes.ReparsePoint) != 0
-                ? $"Lien symbolique, jonction ou fichier à réanalyse ignoré : « {info.FullName} »." : null;
+                ? L.F($"Lien symbolique, jonction ou fichier à réanalyse ignoré : « {info.FullName} ».", $"Symbolic link, junction or reparse file skipped: ‘{info.FullName}’.") : null;
             long? size = kind == EntryKind.File && problem is null ? new FileInfo(info.FullName).Length : null;
             return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, problem);
         }
 
         private void MarkDirectoryProblem(Snapshot snapshot, string fullPath, string reason)
         {
-            var problem = $"« {fullPath} » : {reason}";
+            var problem = L.F($"« {fullPath} » : {reason}", $"‘{fullPath}’: {reason}");
             _errors.Add(problem);
             var relative = Path.GetRelativePath(snapshot.Root, fullPath);
             if (relative == ".")
@@ -517,7 +517,7 @@ public sealed class ComparisonEngine
                 sourceSnapshot.Entries.TryGetValue(relative, out var first);
                 targetSnapshot.Entries.TryGetValue(relative, out var second);
                 var status = ComparisonStatus.Unverified;
-                var detail = "Comparaison du contenu non effectuée.";
+                var detail = L.T("Comparaison du contenu non effectuée.", "Contents have not been compared.");
                 if (first?.Problem is not null || second?.Problem is not null)
                     detail = first?.Problem ?? second!.Problem!;
                 else if (first is null && AncestorProblem(sourceSnapshot, relative) is { } sourceProblem)
@@ -527,27 +527,27 @@ public sealed class ComparisonEngine
                 else if (first is null)
                 {
                     status = ComparisonStatus.OnlyTarget;
-                    detail = "Ce chemin existe uniquement dans le dossier 2.";
+                    detail = L.T("Ce chemin existe uniquement dans le dossier 2.", "This path exists only in folder 2.");
                 }
                 else if (second is null)
                 {
                     status = ComparisonStatus.OnlySource;
-                    detail = "Ce chemin manque dans le dossier 2.";
+                    detail = L.T("Ce chemin manque dans le dossier 2.", "This path is missing from folder 2.");
                 }
                 else if (first.Kind != second.Kind)
                 {
                     status = ComparisonStatus.Conflict;
-                    detail = "Conflit de type : un fichier et un dossier occupent le même chemin.";
+                    detail = L.T("Conflit de type : un fichier et un dossier occupent le même chemin.", "Type conflict: a file and a folder occupy the same path.");
                 }
                 else if (first.Kind == EntryKind.Directory)
                 {
                     status = ComparisonStatus.CommonDirectory;
-                    detail = "Dossier présent au même chemin des deux côtés.";
+                    detail = L.T("Dossier présent au même chemin des deux côtés.", "Folder present at the same path on both sides.");
                 }
                 else if (first.Size != second.Size)
                 {
                     status = ComparisonStatus.Different;
-                    detail = "Même chemin mais tailles différentes : contenus différents.";
+                    detail = L.T("Même chemin mais tailles différentes : contenus différents.", "Same path but different sizes: contents differ.");
                 }
                 _rows[relative] = new ComparisonRow
                 {
@@ -568,7 +568,7 @@ public sealed class ComparisonEngine
         }
 
         private static string? RootProblem(Snapshot snapshot) => snapshot.RootEntry is null
-            ? $"Racine non entièrement accessible : « {snapshot.Root} »."
+            ? L.F($"Racine non entièrement accessible : « {snapshot.Root} ».", $"Root not fully accessible: ‘{snapshot.Root}’.")
             : snapshot.RootEntry.Problem;
 
         private static string? AncestorProblem(Snapshot snapshot, string relative)
@@ -623,7 +623,7 @@ public sealed class ComparisonEngine
 
         private async Task FindMovedFilesAsync(Snapshot sourceSnapshot, Snapshot targetSnapshot)
         {
-            SetPhase("Recherche des fichiers déplacés ou renommés");
+            SetPhase(L.T("Recherche des fichiers déplacés ou renommés", "Looking for moved or renamed files"));
             var candidatesBySize = targetSnapshot.Entries.Values
                 .Where(item => item.Kind == EntryKind.File && item.Problem is null && item.Size.HasValue)
                 .GroupBy(item => item.Size!.Value)
@@ -687,14 +687,14 @@ public sealed class ComparisonEngine
                         TargetPath = match.FullPath,
                         TargetSize = match.Size,
                         TargetHash = sourceHash,
-                        Detail = $"Même contenu SHA-256 trouvé ailleurs dans le dossier 2 : {match.RelativePath}"
+                        Detail = L.F($"Même contenu SHA-256 trouvé ailleurs dans le dossier 2 : {match.RelativePath}", $"The same SHA-256 contents were found elsewhere in folder 2: {match.RelativePath}")
                     };
                 }
                 else
                 {
                     _rows[item.RelativePath] = row with
                     {
-                        Detail = row.Detail + $" Une copie du contenu source existe aussi dans le dossier 2 : {match.RelativePath}"
+                        Detail = row.Detail + L.F($" Une copie du contenu source existe aussi dans le dossier 2 : {match.RelativePath}", $" A copy of the source contents also exists in folder 2: {match.RelativePath}")
                     };
                 }
             }
@@ -731,7 +731,7 @@ public sealed class ComparisonEngine
             try { return await RetryOperationAsync(() => ReadSampleAsync(entry), entry.FullPath); }
             catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
-                var reason = $"Impossible de présélectionner « {entry.FullPath} » : {exception.Message}";
+                var reason = L.F($"Impossible de présélectionner « {entry.FullPath} » : {exception.Message}", $"Unable to filter candidate ‘{entry.FullPath}’: {exception.Message}");
                 _errors.Add(reason);
                 _samples[entry.FullPath] = null;
                 _checkpointFiles.Remove(entry.FullPath);
@@ -748,7 +748,7 @@ public sealed class ComparisonEngine
             var before = new FileInfo(entry.FullPath);
             before.Refresh();
             if (!SameMetadata(entry, ReadEntry(before, entry.RelativePath)))
-                throw new IOException("Le fichier a changé depuis l’inventaire.");
+                throw new IOException(L.T("Le fichier a changé depuis l’inventaire.", "The file has changed since it was listed."));
 
             // No content verdict can be positive from these samples. They only reject
             // candidates; equal signatures always proceed to a complete SHA-256 read.
@@ -757,7 +757,7 @@ public sealed class ComparisonEngine
                 1, FileOptions.Asynchronous | FileOptions.RandomAccess);
             if (stream.Length != entry.Size || File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
                 File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
-                throw new IOException("Les métadonnées du fichier ouvert ont changé depuis l’inventaire.");
+                throw new IOException(L.T("Les métadonnées du fichier ouvert ont changé depuis l’inventaire.", "The opened file's metadata has changed since it was listed."));
             var identity = FileSafety.Identity(stream.SafeFileHandle);
             var buffer = ArrayPool<byte>.Shared.Rent(SampleBlockSize);
             try
@@ -771,7 +771,7 @@ public sealed class ComparisonEngine
                     while (total < SampleBlockSize)
                     {
                         var read = await stream.ReadAsync(buffer.AsMemory(total, SampleBlockSize - total), cancellationToken);
-                        if (read == 0) throw new IOException("Lecture incomplète pendant la présélection.");
+                        if (read == 0) throw new IOException(L.T("Lecture incomplète pendant la présélection.", "Incomplete read during candidate filtering."));
                         total += read;
                         _sampleBytesRead += read;
                         ReportProgress();
@@ -781,12 +781,12 @@ public sealed class ComparisonEngine
                 cancellationToken.ThrowIfCancellationRequested();
                 if (stream.Length != entry.Size || File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
                     File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
-                    throw new IOException("Le fichier a changé pendant la présélection.");
+                    throw new IOException(L.T("Le fichier a changé pendant la présélection.", "The file changed during candidate filtering."));
                 var after = new FileInfo(entry.FullPath);
                 after.Refresh();
                 if (!SameMetadata(entry, ReadEntry(after, entry.RelativePath)) ||
                     (identity is not null && identity != FileSafety.Identity(stream.SafeFileHandle)))
-                    throw new IOException("L’identité ou les métadonnées du fichier ont changé pendant la présélection.");
+                    throw new IOException(L.T("L’identité ou les métadonnées du fichier ont changé pendant la présélection.", "The file's identity or metadata changed during candidate filtering."));
                 var signature = Convert.ToHexString(hasher.GetHashAndReset());
                 _samples[entry.FullPath] = signature;
                 return signature;
@@ -799,7 +799,7 @@ public sealed class ComparisonEngine
             try { return await RetryOperationAsync(() => ReadHashAsync(entry), entry.FullPath); }
             catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
-                var reason = $"Impossible de vérifier « {entry.FullPath} » : {exception.Message}";
+                var reason = L.F($"Impossible de vérifier « {entry.FullPath} » : {exception.Message}", $"Unable to verify ‘{entry.FullPath}’: {exception.Message}");
                 _errors.Add(reason); _hashes[entry.FullPath] = null; _checkpointFiles.Remove(entry.FullPath);
                 MarkUnverified(entry, reason);
                 return null;
@@ -818,7 +818,7 @@ public sealed class ComparisonEngine
                 var before = new FileInfo(entry.FullPath);
                 before.Refresh();
                 if (!SameMetadata(entry, ReadEntry(before, entry.RelativePath)))
-                    throw new IOException("Le fichier a changé depuis l’inventaire.");
+                    throw new IOException(L.T("Le fichier a changé depuis l’inventaire.", "The file has changed since it was listed."));
 
                 // Deny concurrent write/delete handles while bytes are read. An existing
                 // incompatible writer causes a reported sharing violation, never a verdict.
@@ -826,7 +826,7 @@ public sealed class ComparisonEngine
                     1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
                 if (stream.Length != entry.Size || File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
                     File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
-                    throw new IOException("Les métadonnées du fichier ouvert ont changé depuis l’inventaire.");
+                    throw new IOException(L.T("Les métadonnées du fichier ouvert ont changé depuis l’inventaire.", "The opened file's metadata has changed since it was listed."));
 
                 var identity = FileSafety.Identity(stream.SafeFileHandle);
                 if (_checkpointFiles.TryGetValue(entry.FullPath, out var saved) && identity is not null && saved.Identity == identity &&
@@ -855,13 +855,13 @@ public sealed class ComparisonEngine
                 if (readForFile != entry.Size || stream.Length != entry.Size ||
                     File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
                     File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
-                    throw new IOException("Le fichier a changé pendant le calcul SHA-256.");
+                    throw new IOException(L.T("Le fichier a changé pendant le calcul SHA-256.", "The file changed during SHA-256 hashing."));
                 var after = new FileInfo(entry.FullPath);
                 after.Refresh();
                 if (!SameMetadata(entry, ReadEntry(after, entry.RelativePath)))
-                    throw new IOException("Le chemin ou les métadonnées du fichier ont changé pendant sa lecture.");
+                    throw new IOException(L.T("Le chemin ou les métadonnées du fichier ont changé pendant sa lecture.", "The file's path or metadata changed while it was being read."));
                 if (identity is not null && identity != FileSafety.Identity(stream.SafeFileHandle))
-                    throw new IOException("L’identité ou la date de changement du fichier a changé pendant sa lecture.");
+                    throw new IOException(L.T("L’identité ou la date de changement du fichier a changé pendant sa lecture.", "The file's identity or change time changed while it was being read."));
 
                 var hash = Convert.ToHexString(hasher.GetHashAndReset());
                 _hashes[entry.FullPath] = hash;
@@ -886,7 +886,7 @@ public sealed class ComparisonEngine
                 !string.Equals(original.CanonicalRoot, final.CanonicalRoot, StringComparison.OrdinalIgnoreCase))
             {
                 stable = false;
-                var problem = $"La racine « {original.Root} » a changé ou n’est plus entièrement accessible pendant la comparaison.";
+                var problem = L.F($"La racine « {original.Root} » a changé ou n’est plus entièrement accessible pendant la comparaison.", $"Root ‘{original.Root}’ changed or became partly inaccessible during the comparison.");
                 _errors.Add(problem);
                 AddRootProblemRow(original.Root, isSource, problem);
             }
@@ -897,7 +897,7 @@ public sealed class ComparisonEngine
                 if (before is not null && after is not null && SameMetadata(before, after)) continue;
                 stable = false;
                 var entry = after ?? before!;
-                var problem = $"Élément ajouté, supprimé ou modifié pendant la comparaison : « {entry.FullPath} ». Relancez l’analyse.";
+                var problem = L.F($"Élément ajouté, supprimé ou modifié pendant la comparaison : « {entry.FullPath} ». Relancez l’analyse.", $"Item added, removed or changed during the comparison: ‘{entry.FullPath}’. Scan again.");
                 _errors.Add(problem);
                 if (!_rows.TryGetValue(relative, out var existingRow))
                 {
@@ -990,19 +990,19 @@ public sealed class ComparisonEngine
 
     private static string NormalizeRoot(string path, string label)
     {
-        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException($"Choisissez le {label}.", nameof(path));
+        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException(L.F($"Choisissez le {label}.", $"Choose {label}."), nameof(path));
         try
         {
             var fullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
             var attributes = File.GetAttributes(fullPath);
-            if ((attributes & FileAttributes.Directory) == 0) throw new ArgumentException($"Le {label} n’est pas un dossier : {fullPath}", nameof(path));
+            if ((attributes & FileAttributes.Directory) == 0) throw new ArgumentException(L.F($"Le {label} n’est pas un dossier : {fullPath}", $"The path for {label} is not a folder: {fullPath}"), nameof(path));
             if ((attributes & FileAttributes.ReparsePoint) != 0)
-                throw new ArgumentException($"Le {label} est un lien ou une jonction. Sélectionnez son dossier réel.", nameof(path));
+                throw new ArgumentException(L.F($"Le {label} est un lien ou une jonction. Sélectionnez son dossier réel.", $"The path for {label} is a link or junction. Select its physical folder."), nameof(path));
             return fullPath;
         }
         catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
         {
-            throw new ArgumentException($"Impossible d’ouvrir le {label} : {exception.Message}", nameof(path), exception);
+            throw new ArgumentException(L.F($"Impossible d’ouvrir le {label} : {exception.Message}", $"Unable to open {label}: {exception.Message}"), nameof(path), exception);
         }
     }
 
@@ -1011,11 +1011,11 @@ public sealed class ComparisonEngine
         try
         {
             if (RelatedRoots(sourceRoot, targetRoot) || RelatedRoots(CanonicalRoot(sourceRoot), CanonicalRoot(targetRoot)))
-                throw new ArgumentException("Choisissez deux dossiers distincts : aucun ne doit être contenu dans l’autre.");
+                throw new ArgumentException(L.T("Choisissez deux dossiers distincts : aucun ne doit être contenu dans l’autre.", "Choose two separate folders: neither may be inside the other."));
         }
         catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
         {
-            throw new ArgumentException($"Impossible de confirmer les chemins réels des dossiers : {exception.Message}", exception);
+            throw new ArgumentException(L.F($"Impossible de confirmer les chemins réels des dossiers : {exception.Message}", $"Unable to confirm the physical folder paths: {exception.Message}"), exception);
         }
     }
 

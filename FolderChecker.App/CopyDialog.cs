@@ -21,37 +21,37 @@ public sealed class CopyDialog : Window
         NameScope.SetNameScope(this, new NameScope());
         var panel = new DockPanel { Margin = new Thickness(24) };
         var heading = new StackPanel();
-        heading.Children.Add(new TextBlock { Text = "Compléter les dossiers", FontSize = 25, FontWeight = FontWeights.SemiBold });
-        heading.Children.Add(new TextBlock { Text = "Ajoutez les fichiers et dossiers absents de chaque côté, ou choisissez un seul sens. Les originaux restent à leur place et les fichiers existants ne sont jamais écrasés.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 16), Foreground = RowView.Brush("#ACACAC") });
+        heading.Children.Add(new TextBlock { Text = L.T("Compléter les dossiers", "Complete folders"), FontSize = 25, FontWeight = FontWeights.SemiBold });
+        heading.Children.Add(new TextBlock { Text = L.T("Ajoutez les fichiers et dossiers absents de chaque côté, ou choisissez un seul sens. Les originaux restent à leur place et les fichiers existants ne sont jamais écrasés.", "Add missing files and folders on both sides, or choose one direction. Originals stay in place and existing files are never overwritten."), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 16), Foreground = RowView.Brush("#ACACAC") });
         var direction = new ComboBox { Height = 40, DisplayMemberPath = nameof(Choice.Label) };
         RegisterName("DirectionBox", direction);
         bool canCreate = result is { Cancelled: false, SnapshotVerified: true } && result.Errors.Count == 0 &&
             result.Rows.All(row => row.Status != ComparisonStatus.Unverified);
         if (canCreate)
         {
-            direction.Items.Add(new Choice("Compléter les deux dossiers (1 ⇄ 2)", CopyChoice.Both));
-            direction.Items.Add(new Choice("Compléter le dossier 2 (1 → 2)", CopyChoice.Forward));
-            direction.Items.Add(new Choice("Compléter le dossier 1 (2 → 1)", CopyChoice.Backward));
+            direction.Items.Add(new Choice(L.T("Compléter les deux dossiers (1 ⇄ 2)", "Complete both folders (1 ⇄ 2)"), CopyChoice.Both));
+            direction.Items.Add(new Choice(L.T("Compléter le dossier 2 (1 → 2)", "Complete folder 2 (1 → 2)"), CopyChoice.Forward));
+            direction.Items.Add(new Choice(L.T("Compléter le dossier 1 (2 → 1)", "Complete folder 1 (2 → 1)"), CopyChoice.Backward));
         }
         bool canResume = saved != null && saved.Items.Any(i => !i.Completed);
-        if (canResume) direction.Items.Add(new Choice("Reprendre la copie enregistrée", CopyChoice.Resume));
+        if (canResume) direction.Items.Add(new Choice(L.T("Reprendre la copie enregistrée", "Resume saved copy"), CopyChoice.Resume));
         heading.Children.Add(direction);
-        var summary = new TextBlock { Text = "Choisissez le sens de la copie.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 14, 0, 12) };
+        var summary = new TextBlock { Text = L.T("Choisissez le sens de la copie.", "Choose the copy direction."), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 14, 0, 12) };
         RegisterName("SummaryText", summary);
         heading.Children.Add(summary);
         var conflictCount = result?.Rows.Count(row => row.Status is ComparisonStatus.Different or ComparisonStatus.Conflict) ?? 0;
         var exclusions = new TextBlock { Text = conflictCount > 0
-            ? $"{conflictCount:N0} contenu(s) différent(s) ou conflit(s) exclus : aucun remplacement automatique. Ces écarts resteront à résoudre après la copie."
-            : "Seuls les chemins absents seront complétés. Un même chemin avec deux contenus différents doit être résolu séparément.",
+            ? L.F($"{conflictCount:N0} contenu(s) différent(s) ou conflit(s) exclus : aucun remplacement automatique. Ces écarts resteront à résoudre après la copie.", $"{conflictCount:N0} different file(s) or conflict(s) excluded: no automatic replacement. These differences will still need resolving after copying.")
+            : L.T("Seuls les chemins absents seront complétés. Un même chemin avec deux contenus différents doit être résolu séparément.", "Only missing paths will be filled. Different contents at the same path must be resolved separately."),
             TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush(conflictCount > 0 ? "#E8C395" : "#ACACAC"), Margin = new Thickness(0, 0, 0, 10) };
         RegisterName("ExclusionsText", exclusions);
         heading.Children.Add(exclusions);
-        heading.Children.Add(new TextBlock { Text = "Un contenu retrouvé sous un autre nom sera aussi recopié à son chemin manquant, pour compléter l’arborescence.", TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#ACACAC"), Margin = new Thickness(0, 0, 0, 12) });
-        if (canResume) heading.Children.Add(new TextBlock { Text = "Une copie incomplète est enregistrée. Reprenez-la pour conserver son avancement ; lancer une autre copie remplacera son journal.", TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#E8C395"), Margin = new Thickness(0, 0, 0, 12) });
+        heading.Children.Add(new TextBlock { Text = L.T("Un contenu retrouvé sous un autre nom sera aussi recopié à son chemin manquant, pour compléter l’arborescence.", "Content found under a different name will also be copied to its missing path to complete the folder structure."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#ACACAC"), Margin = new Thickness(0, 0, 0, 12) });
+        if (canResume) heading.Children.Add(new TextBlock { Text = L.T("Une copie incomplète est enregistrée. Reprenez-la pour conserver son avancement ; lancer une autre copie remplacera son journal.", "An incomplete copy is saved. Resume it to keep its progress; starting another copy replaces its journal."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#E8C395"), Margin = new Thickness(0, 0, 0, 12) });
         DockPanel.SetDock(heading, Dock.Top); panel.Children.Add(heading);
         var footer = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) };
-        var cancel = new Button { Content = "Annuler", IsCancel = true, Margin = new Thickness(0, 0, 9, 0) };
-        var start = new Button { Content = "Lancer la copie", IsEnabled = false, Style = (Style)Application.Current.FindResource("PrimaryButton") };
+        var cancel = new Button { Content = L.T("Annuler", "Cancel"), IsCancel = true, Margin = new Thickness(0, 0, 9, 0) };
+        var start = new Button { Content = L.T("Lancer la copie", "Start copying"), IsEnabled = false, Style = (Style)Application.Current.FindResource("PrimaryButton") };
         RegisterName("StartCopyButton", start);
         footer.Children.Add(cancel); footer.Children.Add(start); DockPanel.SetDock(footer, Dock.Bottom); panel.Children.Add(footer);
         var list = new ListBox { Background = RowView.Brush("#101010"), Foreground = Foreground, BorderBrush = RowView.Brush("#333333"), Padding = new Thickness(10) };
@@ -61,7 +61,7 @@ public sealed class CopyDialog : Window
         start.Click += (_, _) => { if (Plan != null) { DialogResult = true; Close(); } };
         direction.SelectionChanged += async (_, _) =>
         {
-            var version = ++_version; start.IsEnabled = false; Plan = null; list.ItemsSource = null; summary.Text = "Préparation du récapitulatif…";
+            var version = ++_version; start.IsEnabled = false; Plan = null; list.ItemsSource = null; summary.Text = L.T("Préparation du récapitulatif…", "Preparing preview…");
             if (direction.SelectedItem is not Choice choice) return;
             try
             {
@@ -72,23 +72,26 @@ public sealed class CopyDialog : Window
                 if (version != _version) return;
                 Plan = plan;
                 summary.Text = plan.Bidirectional
-                    ? $"Dossier 1 : {plan.SourceRoot}\nDossier 2 : {plan.TargetRoot}\n{DescribeDirection(plan, false)}\n{DescribeDirection(plan, true)}"
-                    : $"Source : {plan.SourceRoot}\nDestination : {plan.TargetRoot}\n{plan.FileCount:N0} fichier(s) · {RowView.FormatSize(plan.TotalBytes)} · {plan.Items.Count(i => i.Kind == EntryKind.Directory):N0} dossier(s)";
-                list.ItemsSource = plan.Items.Select(i => $"{(i.Completed ? "✓ " : "")}{(plan.Bidirectional ? i.ReverseDirection ? "[2 → 1] " : "[1 → 2] " : "")}[{(i.Kind == EntryKind.Directory ? "Dossier" : "Fichier")}]  {i.RelativePath}").ToList();
-                start.Content = resume ? "Reprendre la copie" : plan.Bidirectional ? "Compléter les deux dossiers" : "Lancer la copie";
+                    ? L.F($"Dossier 1 : {plan.SourceRoot}\nDossier 2 : {plan.TargetRoot}\n{DescribeDirection(plan, false)}\n{DescribeDirection(plan, true)}", $"Folder 1: {plan.SourceRoot}\nFolder 2: {plan.TargetRoot}\n{DescribeDirection(plan, false)}\n{DescribeDirection(plan, true)}")
+                    : L.F($"Source : {plan.SourceRoot}\nDestination : {plan.TargetRoot}\n{plan.FileCount:N0} fichier(s) · {RowView.FormatSize(plan.TotalBytes)} · {plan.Items.Count(i => i.Kind == EntryKind.Directory):N0} dossier(s)", $"Source: {plan.SourceRoot}\nDestination: {plan.TargetRoot}\n{plan.FileCount:N0} file(s) · {RowView.FormatSize(plan.TotalBytes)} · {plan.Items.Count(i => i.Kind == EntryKind.Directory):N0} folder(s)");
+                list.ItemsSource = plan.Items.Select(i => $"{(i.Completed ? "✓ " : "")}{(plan.Bidirectional ? i.ReverseDirection ? "[2 → 1] " : "[1 → 2] " : "")}[{(i.Kind == EntryKind.Directory ? L.T("Dossier", "Folder") : L.T("Fichier", "File"))}]  {i.RelativePath}").ToList();
+                start.Content = resume ? L.T("Reprendre la copie", "Resume copying") : plan.Bidirectional ? L.T("Compléter les deux dossiers", "Complete both folders") : L.T("Lancer la copie", "Start copying");
                 start.IsEnabled = plan.Items.Count > 0;
-                if (plan.Items.Count == 0) summary.Text += "\nAucun chemin manquant à copier dans ce sens.";
+                if (plan.Items.Count == 0) summary.Text += L.T("\nAucun chemin manquant à copier dans ce sens.", "\nNo missing paths to copy in this direction.");
             }
             catch (Exception ex) { if (version == _version) summary.Text = ex.Message; }
         };
         if (direction.Items.Count > 0) direction.SelectedIndex = canResume ? direction.Items.Count - 1 : 0;
-        else summary.Text = "Effectuez une comparaison complète sans erreur pour préparer une copie.";
+        else summary.Text = L.T("Effectuez une comparaison complète sans erreur pour préparer une copie.", "Finish a comparison without errors before preparing a copy.");
     }
     private static string DescribeDirection(CopyPlan plan, bool reverse)
     {
         var items = plan.Items.Where(item => item.ReverseDirection == reverse).ToArray();
-        return $"{(reverse ? "2 → 1" : "1 → 2")} : {items.Count(item => item.Kind == EntryKind.File):N0} fichier(s) · " +
-            $"{RowView.FormatSize(items.Where(item => item.Kind == EntryKind.File).Sum(item => item.Size))} · " +
-            $"{items.Count(item => item.Kind == EntryKind.Directory):N0} dossier(s)";
+        var label = reverse ? "2 → 1" : "1 → 2";
+        var files = items.Count(item => item.Kind == EntryKind.File);
+        var size = RowView.FormatSize(items.Where(item => item.Kind == EntryKind.File).Sum(item => item.Size));
+        var folders = items.Count(item => item.Kind == EntryKind.Directory);
+        return L.F($"{label} : {files:N0} fichier(s) · {size} · {folders:N0} dossier(s)",
+            $"{label}: {files:N0} file(s) · {size} · {folders:N0} folder(s)");
     }
 }

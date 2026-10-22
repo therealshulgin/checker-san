@@ -64,6 +64,9 @@ internal static partial class Program
         ("Copy journals must remain outside the compared trees", CopyJournalOutsideTrees),
         ("Copy plans cannot traverse outside their roots", CopyRejectsTraversal),
         ("A completed file is retained when the remaining copy resumes", CopyKeepsCompletedFiles),
+        ("Copy journals append item states and recover them after a crash", CopyJournalRecoversAppendedStates),
+        ("Copy journal writes stay proportional to the plan size", CopyJournalWritesStayProportional),
+        ("Copy progress within a file is limited to ten updates per second", CopyProgressIsThrottledWithinFiles),
         ("One synchronization fills missing files and empty directories on both sides", SyncCompletesBothTrees),
         ("Synchronization restores absent paths even when their content exists elsewhere", SyncRestoresMovedPaths),
         ("One-way copies restore moved paths in either chosen direction", SyncOneWayMovedPaths),
@@ -118,6 +121,12 @@ internal static partial class Program
         ("DuplicateRemovalValidatesWholeGroupBeforeMutation", DuplicateRemovalValidatesWholeGroupBeforeMutation),
         ("DuplicateRemovalDoesNotTrustEmptyQuarantineMarker", DuplicateRemovalDoesNotTrustEmptyQuarantineMarker),
         ("DuplicateRemovalQuarantineCancellationKeepsProgress", DuplicateRemovalQuarantineCancellationKeepsProgress),
+        ("LocalizationComparisonEnglishPreservesPaths", LocalizationComparisonEnglishPreservesPaths),
+        ("LocalizationComparisonErrorsEnglish", LocalizationComparisonErrorsEnglish),
+        ("LocalizationDuplicatesEnglish", LocalizationDuplicatesEnglish),
+        ("LocalizationCopyEnglishPreservesPaths", LocalizationCopyEnglishPreservesPaths),
+        ("LocalizationRemovalErrorsEnglish", LocalizationRemovalErrorsEnglish),
+        ("LocalizationFrenchCanBeRestored", LocalizationFrenchCanBeRestored),
     ];
 
     public static async Task<int> Main(string[] args)
