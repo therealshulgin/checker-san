@@ -15,8 +15,7 @@ public partial class MainWindow
     private void RefreshCopy()
     {
         _savedCopy = CopyEngine.ReadPlan(_copyCheckpointPath);
-        TransferButton.IsEnabled = _cancellation == null && ((_result is { Cancelled: false, SnapshotVerified: true } && _result.Errors.Count == 0 &&
-            _result.Rows.All(row => row.Status != ComparisonStatus.Unverified)) || (_savedCopy?.Items.Any(i => !i.Completed) == true));
+        TransferButton.IsEnabled = _cancellation == null && ((_result is not null && CopyEngine.CanCreatePlan(_result)) || (_savedCopy?.Items.Any(i => !i.Completed) == true));
         TransferButton.Content = _savedCopy?.Items.Any(i => !i.Completed) == true ? L.T("Compléter / reprendre…", "Complete / resume…") : L.T("Compléter les dossiers…", "Complete folders…");
     }
     private async void Transfer_Click(object sender, RoutedEventArgs e)

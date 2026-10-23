@@ -43,6 +43,8 @@ public sealed class DuplicateRemoval
     private const uint BackupSemantics = 0x02000000, OpenReparsePoint = 0x00200000;
     private const uint SequentialScan = 0x08000000;
 
+    static DuplicateRemoval() => FileSafety.Initialize();
+
     public Task<DuplicateRemovalResult> DeleteAsync(DuplicateResult scan,
         IReadOnlyCollection<string> selectedPaths, DuplicateRemovalMode mode,
         IProgress<DuplicateRemovalProgress>? progress = null, CancellationToken cancellationToken = default)
@@ -64,10 +66,10 @@ public sealed class DuplicateRemoval
         {
             if (!string.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(directory)),
                     QuarantineDirectoryName, StringComparison.OrdinalIgnoreCase) ||
-                (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                FileSafety.Access(directory, File.GetAttributes(directory)) == EntryAccess.Link)
                 return false;
             var path = Path.Combine(directory, MarkerName);
-            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) return false;
+            if (FileSafety.Access(path, File.GetAttributes(path)) == EntryAccess.Link) return false;
             using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             if (file.Length > 4096) return false;
             var marker = JsonSerializer.Deserialize<QuarantineMarker>(file);
@@ -243,7 +245,8 @@ public sealed class DuplicateRemoval
             var identity = FileSafety.Identity(handle);
             if (DuplicateEngine.HardLinkCount(handle) != 1)
                 throw new IOException(L.F($"« {file.RelativePath} » possède des liens physiques, ou leur nombre ne peut pas être vérifié. Aucun fichier de ce groupe ne sera supprimé.", $"‘{file.RelativePath}’ has hard links, or their count cannot be verified. No file in this group will be removed."));
-            if (((FileAttributes)info.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+            // The handle was opened without following links: a link is refused, a local cloud file is read as is.
+            if (((FileAttributes)info.Attributes & FileAttributes.Directory) != 0 || FileSafety.Access(handle) != EntryAccess.Normal ||
                 length != file.Size || DateTime.FromFileTimeUtc(info.LastWriteTime) != file.LastWriteUtc ||
                 DateTime.FromFileTimeUtc(info.CreationTime) != file.CreationUtc ||
                 (FileAttributes)info.Attributes != file.Attributes || !SameIdentity(identity, file.Identity))
@@ -390,7 +393,7 @@ public sealed class DuplicateRemoval
             }
             if (!GetFileInformationByHandleEx(handle, 0, out BasicInfo info, (uint)Marshal.SizeOf<BasicInfo>()) ||
                 ((FileAttributes)info.Attributes & FileAttributes.Directory) == 0 ||
-                ((FileAttributes)info.Attributes & FileAttributes.ReparsePoint) != 0)
+                FileSafety.Access(handle) == EntryAccess.Link)
             {
                 handle.Dispose();
                 throw new IOException(L.T("Une jonction ou un lien ne peut pas être utilisé pour supprimer des doublons.", "A junction or link cannot be used to remove duplicates."));

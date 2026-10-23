@@ -13,6 +13,8 @@ namespace FolderChecker.Core;
 /// <summary>Read-only input comparison, with optional resumable SHA-256 checkpoints outside the input trees.</summary>
 public sealed class ComparisonEngine
 {
+    static ComparisonEngine() => FileSafety.Initialize();
+
     public static CheckpointInfo? ReadCheckpointInfo(string path)
     {
         var data = CheckpointData.Read(path);
@@ -91,9 +93,8 @@ public sealed class ComparisonEngine
                 foreach (var item in sourceSnapshot.Entries.Values)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (item.Kind != EntryKind.File || item.Problem is not null ||
-                        !targetSnapshot.Entries.TryGetValue(item.RelativePath, out var other) ||
-                        other.Kind != EntryKind.File || other.Problem is not null || item.Size != other.Size)
+                    if (!Readable(item) || !targetSnapshot.Entries.TryGetValue(item.RelativePath, out var other) ||
+                        !Readable(other) || item.Size != other.Size)
                         continue;
 
                     // A reusable completed SHA takes priority over sampling: resumed identical
@@ -184,7 +185,7 @@ public sealed class ComparisonEngine
             var certain = !cancelled && snapshotVerified && _errors.Count == 0;
             var sourceContained = certain && IsStrictlyContained(sourceSnapshot);
             var targetContained = certain && IsStrictlyContained(targetSnapshot);
-            var sourceFileCount = sourceSnapshot.Entries.Values.LongCount(item => item.Kind == EntryKind.File);
+            var sourceFileCount = sourceSnapshot.Entries.Values.LongCount(item => item.Kind == EntryKind.File && item.Access != EntryAccess.Link);
             return new ComparisonResult
             {
                 SourceRoot = sourceRoot,
@@ -200,7 +201,7 @@ public sealed class ComparisonEngine
                 TreesIdentical = sourceContained && targetContained,
                 ContentCovered = certain && _coveredSourceFiles.Count == sourceFileCount,
                 SourceFileCount = sourceFileCount,
-                TargetFileCount = targetSnapshot.Entries.Values.LongCount(item => item.Kind == EntryKind.File),
+                TargetFileCount = targetSnapshot.Entries.Values.LongCount(item => item.Kind == EntryKind.File && item.Access != EntryAccess.Link),
                 FilesVerified = _filesHashed,
                 BytesRead = _bytesHashed,
                 SampleBytesRead = _sampleBytesRead,
@@ -215,8 +216,9 @@ public sealed class ComparisonEngine
         private bool IsStrictlyContained(Snapshot snapshot) =>
             // Moved rows can point at a target file under another relative path. Inventory keys
             // preserve which entries actually belong to each tree and require a same-path match.
-            snapshot.Entries.Keys.All(relative => _rows.TryGetValue(relative, out var row) &&
-                row.Status is ComparisonStatus.Identical or ComparisonStatus.CommonDirectory);
+            // A link is not content of its own tree, but a real entry facing a link still fails.
+            snapshot.Entries.All(pair => pair.Value.Access == EntryAccess.Link || (_rows.TryGetValue(pair.Key, out var row) &&
+                row.Status is ComparisonStatus.Identical or ComparisonStatus.CommonDirectory));
 
         private Task<T> RetryIoAsync<T>(Func<T> operation, string path) => RetryOperationAsync(() => Task.FromResult(operation()), path);
 
@@ -422,9 +424,9 @@ public sealed class ComparisonEngine
                         if (entry.Problem is not null) _errors.Add(entry.Problem);
                         if (entry.Kind == EntryKind.File)
                         {
-                            if (countDiscovery) _filesDiscovered++;
+                            if (countDiscovery && entry.Access != EntryAccess.Link) _filesDiscovered++;
                         }
-                        else if (entry.Problem is null) pending.Push(entry.FullPath);
+                        else if (entry.Problem is null && entry.Access != EntryAccess.Link) pending.Push(entry.FullPath);
                         ReportProgress();
                     }
                 }
@@ -437,7 +439,7 @@ public sealed class ComparisonEngine
 
         private List<Entry>? ReadDirectoryBatch(string root, string directory)
         {
-            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) return null;
+            if (FileSafety.Access(directory, File.GetAttributes(directory)) == EntryAccess.Link) return null;
             var result = new List<Entry>();
             var enumeration = new EnumerationOptions
             {
@@ -476,13 +478,12 @@ public sealed class ComparisonEngine
             if (attributes == (FileAttributes)(-1))
                 throw new IOException(L.T("Les attributs de l’élément énuméré sont indisponibles.", "The listed item's attributes are unavailable."));
             var kind = (attributes & FileAttributes.Directory) != 0 ? EntryKind.Directory : EntryKind.File;
-            var problem = (attributes & FileAttributes.ReparsePoint) != 0
-                ? L.F($"Lien symbolique, jonction ou fichier à réanalyse ignoré : « {info.FullName} ».", $"Symbolic link, junction or reparse file skipped: ‘{info.FullName}’.") : null;
+            var access = FileSafety.Access(info.FullName, attributes);
             long? size = null;
-            if (kind == EntryKind.File && problem is null)
+            if (kind == EntryKind.File && access != EntryAccess.Link)
                 size = info is FileInfo file ? file.Length
                     : throw new IOException(L.T("Le type de l’élément énuméré est incohérent.", "The listed item has an inconsistent type."));
-            return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, problem);
+            return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, null, access);
         }
 
         private static Entry ReadEntry(FileSystemInfo info, string relative)
@@ -491,10 +492,9 @@ public sealed class ComparisonEngine
             // into a misleading 'missing file'. GetAttributes preserves the native error.
             var attributes = File.GetAttributes(info.FullName);
             var kind = (attributes & FileAttributes.Directory) != 0 ? EntryKind.Directory : EntryKind.File;
-            var problem = (attributes & FileAttributes.ReparsePoint) != 0
-                ? L.F($"Lien symbolique, jonction ou fichier à réanalyse ignoré : « {info.FullName} ».", $"Symbolic link, junction or reparse file skipped: ‘{info.FullName}’.") : null;
-            long? size = kind == EntryKind.File && problem is null ? new FileInfo(info.FullName).Length : null;
-            return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, problem);
+            var access = FileSafety.Access(info.FullName, attributes);
+            long? size = kind == EntryKind.File && access != EntryAccess.Link ? new FileInfo(info.FullName).Length : null;
+            return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, null, access);
         }
 
         private void MarkDirectoryProblem(Snapshot snapshot, string fullPath, string reason)
@@ -524,6 +524,25 @@ public sealed class ComparisonEngine
                     detail = sourceProblem;
                 else if (second is null && AncestorProblem(targetSnapshot, relative) is { } targetProblem)
                     detail = targetProblem;
+                else if (first?.Access == EntryAccess.Link || second?.Access == EntryAccess.Link)
+                {
+                    status = ComparisonStatus.Skipped;
+                    detail = first?.Access == EntryAccess.Link && second?.Access == EntryAccess.Link
+                        ? L.T("Lien symbolique ou jonction dans les deux dossiers : non suivi, son contenu n’est pas comparé.", "Symbolic link or junction in both folders: not followed, its contents are not compared.")
+                        : first?.Access == EntryAccess.Link
+                            ? L.T("Lien symbolique ou jonction dans le dossier 1 : non suivi, son contenu n’est pas comparé.", "Symbolic link or junction in folder 1: not followed, its contents are not compared.")
+                            : L.T("Lien symbolique ou jonction dans le dossier 2 : non suivi, son contenu n’est pas comparé.", "Symbolic link or junction in folder 2: not followed, its contents are not compared.");
+                }
+                else if (first is null && UnderLink(sourceSnapshot, relative))
+                {
+                    status = ComparisonStatus.Skipped;
+                    detail = L.T("Le dossier 1 a un lien non suivi à cet emplacement : ce chemin n’y est pas comparé.", "Folder 1 has an unfollowed link at this location: this path is not compared there.");
+                }
+                else if (second is null && UnderLink(targetSnapshot, relative))
+                {
+                    status = ComparisonStatus.Skipped;
+                    detail = L.T("Le dossier 2 a un lien non suivi à cet emplacement : ce chemin n’y est pas comparé.", "Folder 2 has an unfollowed link at this location: this path is not compared there.");
+                }
                 else if (first is null)
                 {
                     status = ComparisonStatus.OnlyTarget;
@@ -549,6 +568,12 @@ public sealed class ComparisonEngine
                     status = ComparisonStatus.Different;
                     detail = L.T("Même chemin mais tailles différentes : contenus différents.", "Same path but different sizes: contents differ.");
                 }
+                else if (first.Access == EntryAccess.OnlineOnly || second.Access == EntryAccess.OnlineOnly)
+                {
+                    // Equal sizes prove nothing, and reading would download the file: report the metadata only.
+                    detail = L.T("Fichier disponible uniquement en ligne (OneDrive ou autre service) : non téléchargé, contenu non vérifié. Même taille", "Online-only file (OneDrive or another service): not downloaded, contents not verified. Same size")
+                        + (first.LastWriteUtc == second.LastWriteUtc ? L.T(" et même date de modification.", " and modification date.") : L.T(", date de modification différente.", ", different modification date."));
+                }
                 _rows[relative] = new ComparisonRow
                 {
                     Kind = first?.Kind ?? second!.Kind,
@@ -558,7 +583,8 @@ public sealed class ComparisonEngine
                     TargetPath = second?.FullPath,
                     SourceSize = first?.Size,
                     TargetSize = second?.Size,
-                    Detail = detail
+                    Detail = detail,
+                    OnlineOnly = first?.Access == EntryAccess.OnlineOnly || second?.Access == EntryAccess.OnlineOnly
                 };
             }
             if (RootProblem(sourceSnapshot) is { } firstProblem)
@@ -570,6 +596,14 @@ public sealed class ComparisonEngine
         private static string? RootProblem(Snapshot snapshot) => snapshot.RootEntry is null
             ? L.F($"Racine non entièrement accessible : « {snapshot.Root} ».", $"Root not fully accessible: ‘{snapshot.Root}’.")
             : snapshot.RootEntry.Problem;
+
+        private static bool UnderLink(Snapshot snapshot, string relative)
+        {
+            for (var parent = Path.GetDirectoryName(relative); !string.IsNullOrEmpty(parent); parent = Path.GetDirectoryName(parent))
+                if (snapshot.Entries.TryGetValue(parent, out var entry) && entry.Access == EntryAccess.Link)
+                    return true;
+            return false;
+        }
 
         private static string? AncestorProblem(Snapshot snapshot, string relative)
         {
@@ -598,8 +632,8 @@ public sealed class ComparisonEngine
             var planned = new Dictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
             if (options.FindMovedFiles)
             {
-                var sourceFiles = sourceSnapshot.Entries.Values.Where(item => item.Kind == EntryKind.File && item.Problem is null && item.Size.HasValue).ToArray();
-                var targetFiles = targetSnapshot.Entries.Values.Where(item => item.Kind == EntryKind.File && item.Problem is null && item.Size.HasValue).ToArray();
+                var sourceFiles = sourceSnapshot.Entries.Values.Where(Readable).ToArray();
+                var targetFiles = targetSnapshot.Entries.Values.Where(Readable).ToArray();
                 var commonSizes = sourceFiles.Select(item => item.Size!.Value).Intersect(targetFiles.Select(item => item.Size!.Value)).ToHashSet();
                 foreach (var item in sourceFiles.Concat(targetFiles).Where(item => commonSizes.Contains(item.Size!.Value)))
                     planned[item.FullPath] = item;
@@ -608,9 +642,8 @@ public sealed class ComparisonEngine
             {
                 foreach (var item in sourceSnapshot.Entries.Values)
                 {
-                    if (item.Kind != EntryKind.File || item.Problem is not null ||
-                        !targetSnapshot.Entries.TryGetValue(item.RelativePath, out var other) ||
-                        other.Kind != EntryKind.File || other.Problem is not null || item.Size != other.Size)
+                    if (!Readable(item) || !targetSnapshot.Entries.TryGetValue(item.RelativePath, out var other) ||
+                        !Readable(other) || item.Size != other.Size)
                         continue;
                     planned[item.FullPath] = item;
                     planned[other.FullPath] = other;
@@ -625,7 +658,7 @@ public sealed class ComparisonEngine
         {
             SetPhase(L.T("Recherche des fichiers déplacés ou renommés", "Looking for moved or renamed files"));
             var candidatesBySize = targetSnapshot.Entries.Values
-                .Where(item => item.Kind == EntryKind.File && item.Problem is null && item.Size.HasValue)
+                .Where(Readable)
                 .GroupBy(item => item.Size!.Value)
                 .ToDictionary(group => group.Key, group => new CandidateBucket(
                     group.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray()));
@@ -640,8 +673,8 @@ public sealed class ComparisonEngine
             foreach (var item in sourceSnapshot.Entries.Values)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (item.Kind != EntryKind.File || item.Problem is not null || !item.Size.HasValue ||
-                    _coveredSourceFiles.Contains(item.RelativePath) || !candidatesBySize.TryGetValue(item.Size.Value, out var sizeBucket))
+                if (!Readable(item) || _coveredSourceFiles.Contains(item.RelativePath) ||
+                    !candidatesBySize.TryGetValue(item.Size!.Value, out var sizeBucket))
                     continue;
 
                 _hashes.TryGetValue(item.FullPath, out var sourceHash);
@@ -977,11 +1010,16 @@ public sealed class ComparisonEngine
     }
 
     private sealed record Entry(string RelativePath, string FullPath, EntryKind Kind, long? Size,
-        DateTime LastWriteUtc, DateTime CreationUtc, FileAttributes Attributes, string? Problem);
+        DateTime LastWriteUtc, DateTime CreationUtc, FileAttributes Attributes, string? Problem, EntryAccess Access = EntryAccess.Normal);
+
+    /// <summary>A local file whose contents may be read: not a link, not online-only, without listing problem.</summary>
+    private static bool Readable(Entry entry) =>
+        entry.Kind == EntryKind.File && entry.Problem is null && entry.Access == EntryAccess.Normal && entry.Size.HasValue;
 
     private static bool SameMetadata(Entry first, Entry second) =>
         first.Kind == second.Kind && first.Size == second.Size && first.LastWriteUtc == second.LastWriteUtc &&
-        first.CreationUtc == second.CreationUtc && first.Attributes == second.Attributes && first.Problem == second.Problem;
+        first.CreationUtc == second.CreationUtc && first.Attributes == second.Attributes && first.Problem == second.Problem &&
+        first.Access == second.Access;
 
     private static bool IsFileSystemException(Exception exception) =>
         exception is IOException or UnauthorizedAccessException or SecurityException or NotSupportedException or Win32Exception;
@@ -996,7 +1034,7 @@ public sealed class ComparisonEngine
             var fullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
             var attributes = File.GetAttributes(fullPath);
             if ((attributes & FileAttributes.Directory) == 0) throw new ArgumentException(L.F($"Le {label} n’est pas un dossier : {fullPath}", $"The path for {label} is not a folder: {fullPath}"), nameof(path));
-            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            if (FileSafety.Access(fullPath, attributes) == EntryAccess.Link)
                 throw new ArgumentException(L.F($"Le {label} est un lien ou une jonction. Sélectionnez son dossier réel.", $"The path for {label} is a link or junction. Select its physical folder."), nameof(path));
             return fullPath;
         }

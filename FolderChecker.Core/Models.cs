@@ -4,7 +4,9 @@ public enum EntryKind { File, Directory }
 
 public enum ComparisonStatus
 {
-    Identical, Different, OnlySource, OnlyTarget, Moved, CommonDirectory, Conflict, Unverified
+    Identical, Different, OnlySource, OnlyTarget, Moved, CommonDirectory, Conflict, Unverified,
+    /// <summary>A symbolic link or junction, or a path under one: reported, never followed or compared.</summary>
+    Skipped
 }
 
 public sealed record ComparisonOptions(bool FindMovedFiles = true)
@@ -38,6 +40,8 @@ public sealed record ComparisonRow
     public string Detail { get; init; } = "";
     public string? SourceHash { get; init; }
     public string? TargetHash { get; init; }
+    /// <summary>One side is an online-only cloud file. It was not read, because reading would download it.</summary>
+    public bool OnlineOnly { get; init; }
 }
 
 public sealed record ComparisonProgress

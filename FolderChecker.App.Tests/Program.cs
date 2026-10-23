@@ -40,6 +40,7 @@ internal static partial class Program
         ("The copy preview routes both directions and each single direction correctly", CopyPreviewDirections),
         ("An unfinished copy is selected for resumption without losing its directions", CopyPreviewResume),
         ("A conflicts-only comparison cannot launch an empty completion", CopyPreviewConflictsOnly),
+        ("Skipped links and online-only files explain the verdict without blocking copies", LinksAndOnlineFilesExplainVerdict),
         ("Duplicate results start with no files selected", DuplicateUiStartsUnselected),
         ("Selecting extra copies keeps one file per group and blocks all-selected groups", DuplicateUiKeepsOne),
         ("Changing the duplicate folder invalidates earlier results", DuplicateUiChangedPath),

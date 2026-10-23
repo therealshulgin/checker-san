@@ -14,6 +14,8 @@ namespace FolderChecker.Core;
 /// </summary>
 public sealed class DuplicateEngine
 {
+    static DuplicateEngine() => FileSafety.Initialize();
+
     public static string? ReadCheckpointRoot(string path)
     {
         try
@@ -81,7 +83,7 @@ public sealed class DuplicateEngine
         public List<CacheEntry> Files { get; init; } = [];
     }
 
-    private sealed record InventoryItem(DuplicateFile File, bool Directory);
+    private sealed record InventoryItem(DuplicateFile File, bool Directory, EntryAccess Access);
 
     private sealed class Run(string requestedRoot, DuplicateScanOptions options,
         IProgress<DuplicateProgress>? progress, CancellationToken cancellationToken)
@@ -122,8 +124,10 @@ public sealed class DuplicateEngine
                 PrepareCheckpoint();
                 SetPhase(L.T("Inventaire des fichiers", "Listing files"));
                 var initial = await InventoryAsync(true);
-                foreach (var sizeGroup in initial.Values.Where(item => !item.Directory
-                             && (item.File.Attributes & FileAttributes.ReparsePoint) == 0)
+                var onlineOnly = initial.Values.Count(item => item.Access == EntryAccess.OnlineOnly);
+                if (onlineOnly > 0)
+                    _warnings.Add(L.F($"{onlineOnly:N0} fichier(s) disponible(s) uniquement en ligne n’ont pas été analysés, pour ne pas les télécharger.", $"{onlineOnly:N0} online-only file(s) were not scanned, to avoid downloading them."));
+                foreach (var sizeGroup in initial.Values.Where(item => !item.Directory && item.Access == EntryAccess.Normal)
                              .GroupBy(item => item.File.Size).Where(group => group.Count() > 1))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -176,7 +180,7 @@ public sealed class DuplicateEngine
                 {
                     if (!final.TryGetValue(pair.Key, out var last))
                         _errors.Add(L.F($"Chemin retiré pendant le scan : {pair.Key}", $"Path removed during the scan: {pair.Key}"));
-                    else if (pair.Value.Directory != last.Directory || !SameMetadata(pair.Value.File, last.File))
+                    else if (pair.Value.Directory != last.Directory || pair.Value.Access != last.Access || !SameMetadata(pair.Value.File, last.File))
                         _errors.Add(L.F($"Chemin modifié pendant le scan : {pair.Key}. Relancez la recherche.", $"Path changed during the scan: {pair.Key}. Run the search again."));
                 }
                 // The identity check also detects changes whose size and timestamps were restored.
@@ -237,7 +241,7 @@ public sealed class DuplicateEngine
                         var items = new List<InventoryItem>();
                         var directoryAttributes = File.GetAttributes(directory);
                         if (!string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase)
-                            && (directoryAttributes & FileAttributes.ReparsePoint) != 0)
+                            && FileSafety.Access(directory, directoryAttributes) == EntryAccess.Link)
                             throw new IOException(L.F($"Le dossier est devenu un lien : {directory}", $"The folder has been replaced by a link: {directory}"));
                         foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
                         {
@@ -246,7 +250,8 @@ public sealed class DuplicateEngine
                             // would add multiple network round trips per file before any hashing.
                             var attributes = entry.Attributes;
                             var isDirectory = (attributes & FileAttributes.Directory) != 0;
-                            if (isDirectory && (attributes & FileAttributes.ReparsePoint) == 0)
+                            var access = FileSafety.Access(entry.FullName, attributes);
+                            if (isDirectory && access != EntryAccess.Link)
                             {
                                 // NTFS directory-index timestamps can lag behind child creation.
                                 // Refresh directories only so their final check compares current
@@ -267,10 +272,10 @@ public sealed class DuplicateEngine
                             var file = new DuplicateFile
                             {
                                 FullPath = entry.FullName, RelativePath = Path.GetRelativePath(_root, entry.FullName),
-                                Size = isDirectory || (attributes & FileAttributes.ReparsePoint) != 0 ? 0 : ((FileInfo)entry).Length,
+                                Size = isDirectory || access == EntryAccess.Link ? 0 : ((FileInfo)entry).Length,
                                 LastWriteUtc = entry.LastWriteTimeUtc, CreationUtc = entry.CreationTimeUtc, Attributes = attributes
                             };
-                            items.Add(new InventoryItem(file, isDirectory));
+                            items.Add(new InventoryItem(file, isDirectory, access));
                         }
                         return items;
                     }, directory);
@@ -287,9 +292,10 @@ public sealed class DuplicateEngine
                         _errors.Add(L.F($"Chemins ambigus, seule la casse diffère : {item.File.RelativePath}", $"Ambiguous paths differing only by case: {item.File.RelativePath}"));
                         continue;
                     }
-                    if ((item.File.Attributes & FileAttributes.ReparsePoint) != 0)
+                    if (item.Access == EntryAccess.Link)
                     {
-                        _errors.Add(L.F($"Lien ou point de réanalyse ignoré : {item.File.RelativePath}", $"Link or reparse point skipped: {item.File.RelativePath}"));
+                        // Never followed: its destination may lie outside this folder or repeat part of it.
+                        _warnings.Add(L.F($"Lien ou jonction non suivi : {item.File.RelativePath}", $"Link or junction not followed: {item.File.RelativePath}"));
                         continue;
                     }
                     if (item.Directory) pending.Push(item.File.FullPath);
@@ -441,7 +447,7 @@ public sealed class DuplicateEngine
             foreach (var part in relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
             {
                 current = Path.Combine(current, part);
-                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                if (FileSafety.Access(current, File.GetAttributes(current)) == EntryAccess.Link)
                     throw new IOException(L.T("Un lien ou point de réanalyse a remplacé le chemin.", "The path has been replaced by a link or reparse point."));
             }
         }
@@ -450,7 +456,7 @@ public sealed class DuplicateEngine
         {
             var info = new FileInfo(original.FullPath);
             var attributes = File.GetAttributes(original.FullPath);
-            if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            if ((attributes & FileAttributes.Directory) != 0 || FileSafety.Access(original.FullPath, attributes) != EntryAccess.Normal)
                 throw new IOException(L.T("Le chemin ne désigne plus un fichier ordinaire.", "The path no longer refers to a regular file."));
             return original with
             {

@@ -19,6 +19,8 @@ public sealed class RowView(ComparisonRow row)
         ComparisonStatus.Moved => L.T("Retrouvé ailleurs", "Found elsewhere"),
         ComparisonStatus.Different => L.T("Contenu différent", "Different content"),
         ComparisonStatus.Conflict => L.T("Conflit fichier / dossier", "File / folder conflict"),
+        ComparisonStatus.Skipped => L.T("Lien non suivi", "Link not followed"),
+        _ when Row.OnlineOnly => L.T("En ligne · non téléchargé", "Online only · not downloaded"),
         _ => L.T("Non vérifié", "Not verified")
     };
     public Brush StatusBackground => Brush("#2B2B2B");
@@ -27,7 +29,7 @@ public sealed class RowView(ComparisonRow row)
         ComparisonStatus.Identical or ComparisonStatus.CommonDirectory => "#A5D9BB",
         ComparisonStatus.OnlySource or ComparisonStatus.OnlyTarget or ComparisonStatus.Unverified => "#E8C395",
         ComparisonStatus.Different or ComparisonStatus.Conflict => "#F1A9B7",
-        ComparisonStatus.Moved => "#C7CDD6",
+        ComparisonStatus.Moved or ComparisonStatus.Skipped => "#C7CDD6",
         _ => "#BDC6E6"
     });
     public static Brush Brush(string hex)
@@ -36,13 +38,5 @@ public sealed class RowView(ComparisonRow row)
         brush.Freeze();
         return brush;
     }
-    public static string FormatSize(long? bytes)
-    {
-        if (!bytes.HasValue) return "—";
-        double n = bytes.Value;
-        string[] units = L.IsEnglish ? ["B", "KiB", "MiB", "GiB", "TiB", "PiB"] : ["o", "Kio", "Mio", "Gio", "Tio", "Pio"];
-        int i = 0;
-        while (n >= 1024 && i < units.Length - 1) { n /= 1024; i++; }
-        return n.ToString(i == 0 ? "N0" : "N1", L.Culture) + " " + units[i];
-    }
+    public static string FormatSize(long? bytes) => bytes.HasValue ? L.Size(bytes.Value) : "—";
 }

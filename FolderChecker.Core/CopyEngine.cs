@@ -1,5 +1,9 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace FolderChecker.Core;
 
@@ -29,6 +33,8 @@ public sealed class CopyItem
     public long Size { get; set; }
     public DateTime LastWriteUtc { get; set; }
     public DateTime CreationUtc { get; set; }
+    /// <summary>Read-only, hidden, system, archive and not-indexed bits to reproduce; null in journals from earlier versions.</summary>
+    public FileAttributes? Attributes { get; set; }
     public string PartialName { get; set; } = ".checkersan-" + Guid.NewGuid().ToString("N") + ".partial";
     public bool Completed { get; set; }
     public string? VerifiedHash { get; set; }
@@ -37,9 +43,29 @@ public sealed class CopyItem
     public string? DestinationIdentity { get; set; }
 }
 
+/// <summary>Space a plan still needs on one destination volume, rounded up to whole 4 KiB clusters per file.</summary>
+public sealed record SpaceNeed(string Root, long Required, long Available)
+{
+    public bool Sufficient => Available >= Required;
+}
+
 /// <summary>Copies only explicitly planned missing paths. Never overwrites a final destination.</summary>
 public sealed class CopyEngine
 {
+    private const FileOptions NoBuffering = (FileOptions)0x20000000;
+    private const FileAttributes CopiedAttributes = FileAttributes.ReadOnly | FileAttributes.Hidden | FileAttributes.System |
+        FileAttributes.Archive | FileAttributes.NotContentIndexed;
+
+    static CopyEngine() => FileSafety.Initialize();
+
+    /// <summary>
+    /// A copy needs a comparison without errors. Online-only files present on both sides stay unverified,
+    /// but they are never copied, so they do not prevent completing the folders.
+    /// </summary>
+    public static bool CanCreatePlan(ComparisonResult comparison) =>
+        !comparison.Cancelled && comparison.SnapshotVerified && comparison.Errors.Count == 0 &&
+        comparison.Rows.All(row => row.Status != ComparisonStatus.Unverified || row.OnlineOnly);
+
     public static CopyPlan CreatePlan(ComparisonResult comparison, bool sourceToTarget)
     {
         ValidateComparison(comparison);
@@ -72,8 +98,7 @@ public sealed class CopyEngine
 
     private static void ValidateComparison(ComparisonResult comparison)
     {
-        if (comparison.Cancelled || !comparison.SnapshotVerified || comparison.Errors.Count > 0 ||
-            comparison.Rows.Any(row => row.Status == ComparisonStatus.Unverified))
+        if (!CanCreatePlan(comparison))
             throw new InvalidOperationException(L.T("Terminez une comparaison sans erreur avant de préparer une copie.", "Complete a comparison without errors before preparing a copy."));
     }
 
@@ -81,14 +106,15 @@ public sealed class CopyEngine
     {
         var source = reverseDirection ? plan.TargetRoot : plan.SourceRoot;
         var blocked = comparison.Rows
-            .Where(r => r.Status is ComparisonStatus.Conflict or ComparisonStatus.Unverified)
+            .Where(r => r.Status is ComparisonStatus.Conflict or ComparisonStatus.Unverified or ComparisonStatus.Skipped)
             .Select(r => r.RelativePath.Replace('/', '\\').TrimEnd('\\') + "\\")
             .ToArray();
-        foreach (var row in comparison.Rows.Where(r => sourceToTarget
+        // Copying an online-only file would download it, and its changing state would fail the source checks.
+        foreach (var row in comparison.Rows.Where(r => !r.OnlineOnly && (sourceToTarget
                      ? r.Status is ComparisonStatus.OnlySource or ComparisonStatus.Moved
-                     : r.Status == ComparisonStatus.OnlyTarget))
+                     : r.Status == ComparisonStatus.OnlyTarget)))
         {
-            // An absent descendant cannot be created below a file/directory conflict.
+            // An absent descendant cannot be created below a file/directory conflict or through a link.
             var relative = row.RelativePath.Replace('/', '\\');
             if (blocked.Any(prefix => relative.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))) continue;
             var path = SafePath(source, row.RelativePath);
@@ -100,10 +126,97 @@ public sealed class CopyEngine
                 item.Size = file.Length;
                 item.LastWriteUtc = File.GetLastWriteTimeUtc(file.SafeFileHandle);
                 item.CreationUtc = File.GetCreationTimeUtc(file.SafeFileHandle);
+                item.Attributes = File.GetAttributes(file.SafeFileHandle) & CopiedAttributes;
                 item.SourceIdentity = IdentityText(FileSafety.Identity(file.SafeFileHandle));
+            }
+            else
+            {
+                var folder = new DirectoryInfo(path);
+                item.LastWriteUtc = folder.LastWriteTimeUtc;
+                item.CreationUtc = folder.CreationTimeUtc;
+                item.Attributes = folder.Attributes & CopiedAttributes;
             }
             plan.Items.Add(item);
         }
+    }
+
+    /// <summary>
+    /// Space still needed per destination volume: unfinished files minus their saved partial data.
+    /// Both directions of a two-way copy are added together when they share a volume.
+    /// </summary>
+    public static IReadOnlyList<SpaceNeed> SpaceNeeds(CopyPlan plan)
+    {
+        // Resolving a volume walks the whole path, so it is done once per destination root.
+        var volumes = plan.Items.Select(i => i.ReverseDirection ? plan.SourceRoot : plan.TargetRoot)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToDictionary(root => root, VolumeOf, StringComparer.OrdinalIgnoreCase);
+        var needs = new Dictionary<string, (string Root, long Required)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (root, volume) in volumes) needs.TryAdd(volume, (root, 0));
+        foreach (var item in plan.Items.Where(i => i.Kind == EntryKind.File && !i.Completed))
+        {
+            var root = item.ReverseDirection ? plan.SourceRoot : plan.TargetRoot;
+            var remaining = item.Size;
+            if (item.PartialIdentity is not null)
+            {
+                var partial = new FileInfo(Path.Combine(Path.GetDirectoryName(SafePath(root, item.RelativePath))!, item.PartialName));
+                if (partial.Exists) remaining = Math.Max(0, remaining - partial.Length);
+            }
+            var volume = volumes[root];
+            needs[volume] = (needs[volume].Root, needs[volume].Required + (remaining + 4095) / 4096 * 4096);
+        }
+        return needs.Values.Select(need => new SpaceNeed(need.Root, need.Required, FreeSpace(need.Root))).ToArray();
+    }
+
+    private static string VolumeOf(string root)
+    {
+        var volume = new StringBuilder(32768);
+        if (!GetVolumePathNameW(root, volume, (uint)volume.Capacity)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return volume.ToString();
+    }
+
+    private static long FreeSpace(string root)
+    {
+        // Free space available to this user, after quotas; works for drive letters, mount points and shares.
+        if (!GetDiskFreeSpaceExW(root, out var available, out _, out _)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return available > long.MaxValue ? long.MaxValue : (long)available;
+    }
+
+    /// <summary>A sector-aligned slice of a pinned array, as reads bypassing the Windows cache require.</summary>
+    private static Memory<byte> AlignedBuffer(int size)
+    {
+        const int alignment = 64 * 1024;
+        var array = GC.AllocateUninitializedArray<byte>(size + alignment, pinned: true);
+        var offset = (int)((alignment - (long)Marshal.UnsafeAddrOfPinnedArrayElement(array, 0) % alignment) % alignment);
+        return array.AsMemory(offset, size);
+    }
+
+    /// <summary>
+    /// Hashes through a handle that bypasses the Windows cache, so verification reads what reached the disk
+    /// or the share rather than the copy still held in memory. A device refusing such reads is read normally.
+    /// </summary>
+    private static string HashFromDisk(SafeFileHandle handle, string path, Memory<byte> buffer, Action progress, CancellationToken ct)
+    {
+        try { return HashHandle(handle, buffer.Span, progress, ct); }
+        catch (IOException ex) when ((ex.HResult & 0xFFFF) == 87)
+        {
+            using var cached = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            return HashHandle(cached, buffer.Span, progress, ct);
+        }
+    }
+
+    private static string HashHandle(SafeFileHandle handle, Span<byte> buffer, Action progress, CancellationToken ct)
+    {
+        using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var length = RandomAccess.GetLength(handle);
+        // Stops at the length: an uncached read at an unaligned end offset would be rejected.
+        for (long offset = 0; offset < length;)
+        {
+            ct.ThrowIfCancellationRequested();
+            var read = RandomAccess.Read(handle, buffer, offset);
+            if (read == 0) break;
+            hasher.AppendData(buffer[..read]); offset += read;
+            progress();
+        }
+        return Convert.ToHexString(hasher.GetHashAndReset());
     }
 
     private static void FinishPlan(CopyPlan plan)
@@ -165,11 +278,18 @@ public sealed class CopyEngine
         Task<T> Retry<T>(Func<Task<T>> action, string path) => FileSystemRetryPolicy.ExecuteAsync(_ => action(), 3, 1000,
             (attempt, delay) => Report(L.F($"Reconnexion dans {delay.TotalSeconds:0} s", $"Reconnecting in {delay.TotalSeconds:0} s"), path, attempt), ct);
         byte[] buffer = new byte[1024 * 1024], prior = new byte[buffer.Length];
+        var checkBuffer = AlignedBuffer(1024 * 1024);
+        var interrupted = false;
         try
         {
             ValidatePlanStructure(plan);
             totalFiles = plan.FileCount;
             await Retry(() => { ValidateRoots(plan); return Task.FromResult(true); }, plan.TargetRoot);
+            var shortages = (await Retry(() => Task.FromResult(SpaceNeeds(plan)), plan.TargetRoot)).Where(need => !need.Sufficient).ToArray();
+            if (shortages.Length > 0)
+                throw new IOException(string.Join(" ", shortages.Select(need => L.F(
+                    $"Espace insuffisant sur {need.Root} : {L.Size(need.Required)} nécessaires, {L.Size(need.Available)} disponibles. Aucune copie n’a commencé.",
+                    $"Not enough space on {need.Root}: {L.Size(need.Required)} needed, {L.Size(need.Available)} available. No copy has started."))));
             using var journal = Journal.Open(plan, checkpointPath);
             foreach (var item in plan.Items)
             {
@@ -202,12 +322,14 @@ public sealed class CopyEngine
                         {
                             AssertNoLinks(targetRoot, target);
                             if (item.VerifiedHash is null) throw new IOException(L.T("La destination existe déjà : elle n’a pas été remplacée.", "The destination already exists and has not been replaced."));
-                            using var existing = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.Asynchronous);
-                            var identity = IdentityText(FileSafety.Identity(existing.SafeFileHandle));
-                            if (!(item.Completed && identity is not null && identity == item.DestinationIdentity && existing.Length == item.Size))
+                            using var existing = File.OpenHandle(target, FileMode.Open, FileAccess.Read, FileShare.Read, NoBuffering);
+                            var identity = IdentityText(FileSafety.Identity(existing));
+                            var length = RandomAccess.GetLength(existing);
+                            if (!(item.Completed && identity is not null && identity == item.DestinationIdentity && length == item.Size))
                             {
-                                var hash = Convert.ToHexString(await SHA256.HashDataAsync(existing, ct));
-                                if (existing.Length != item.Size || hash != item.VerifiedHash) throw new IOException(L.T("La destination existante a un contenu différent : aucun écrasement.", "The existing destination has different contents and will not be overwritten."));
+                                var phase = L.T("Vérification SHA-256 de la copie", "Verifying the copy with SHA-256");
+                                var hash = HashFromDisk(existing, target, checkBuffer, () => Report(phase, displayPath), ct);
+                                if (length != item.Size || hash != item.VerifiedHash) throw new IOException(L.T("La destination existante a un contenu différent : aucun écrasement.", "The existing destination has different contents and will not be overwritten."));
                             }
                             item.DestinationIdentity = identity; item.Completed = true;
                             journal.Record(item);
@@ -217,6 +339,7 @@ public sealed class CopyEngine
                         var partial = Path.Combine(Path.GetDirectoryName(target)!, item.PartialName);
                         AssertNoLinks(targetRoot, partial);
                         var existed = Exists(partial);
+                        string expectedHash;
                         using (var output = new FileStream(partial, existed ? FileMode.Open : FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
                         {
                             var partialId = IdentityText(FileSafety.Identity(output.SafeFileHandle), includeChangeTime: false);
@@ -247,22 +370,29 @@ public sealed class CopyEngine
                                 sourceHasher.AppendData(buffer, 0, read); written += read;
                                 Report(L.T("Copie", "Copying"), displayPath);
                             }
-                            await output.FlushAsync(ct); output.Flush(true);
+                            await output.FlushAsync(ct);
+                            // Explicitly set dates are kept when the handle closes; they are flushed with the data.
+                            File.SetCreationTimeUtc(output.SafeFileHandle, item.CreationUtc);
+                            File.SetLastWriteTimeUtc(output.SafeFileHandle, item.LastWriteUtc);
+                            output.Flush(true);
                             ValidateSource(item, input);
-                            var expectedHash = Convert.ToHexString(sourceHasher.GetHashAndReset());
-                            output.Position = 0;
-                            Report(L.T("Vérification SHA-256 de la copie", "Verifying the copy with SHA-256"), displayPath);
-                            var destinationHash = Convert.ToHexString(await SHA256.HashDataAsync(output, ct));
-                            if (output.Length != item.Size || destinationHash != expectedHash) throw new IOException(L.T("La vérification SHA-256 de la copie a échoué.", "SHA-256 verification of the copy failed."));
-                            item.VerifiedHash = expectedHash;
-                            journal.Record(item);
+                            expectedHash = Convert.ToHexString(sourceHasher.GetHashAndReset());
                         }
+                        var verifying = L.T("Vérification SHA-256 de la copie", "Verifying the copy with SHA-256");
+                        Report(verifying, displayPath);
+                        // Writers stay excluded until the final name exists; sharing deletion only allows that rename.
+                        using var check = File.OpenHandle(partial, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, NoBuffering);
+                        if (RandomAccess.GetLength(check) != item.Size || HashFromDisk(check, partial, checkBuffer, () => Report(verifying, displayPath), ct) != expectedHash)
+                            throw new IOException(L.T("La vérification SHA-256 de la copie a échoué.", "SHA-256 verification of the copy failed."));
+                        item.VerifiedHash = expectedHash;
+                        journal.Record(item);
                         ct.ThrowIfCancellationRequested();
                         AssertNoLinks(targetRoot, Path.GetDirectoryName(target)!);
                         // Both handles have been validated; final move is no-overwrite and on the same volume/share.
                         File.Move(partial, target, overwrite: false);
-                        using (var final = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read))
-                            item.DestinationIdentity = IdentityText(FileSafety.Identity(final.SafeFileHandle));
+                        // Applied after the rename: a read-only temporary file could not be resumed.
+                        if (item.Attributes is { } attributes) File.SetAttributes(target, attributes == 0 ? FileAttributes.Normal : attributes);
+                        item.DestinationIdentity = IdentityText(FileSafety.Identity(check));
                         item.Completed = true; journal.Record(item);
                         return true;
                     }, displayPath);
@@ -270,10 +400,29 @@ public sealed class CopyEngine
                     Report(L.T("Élément terminé", "Item completed"), displayPath);
                 }
                 catch (OperationCanceledException) { throw; }
-                catch (Exception ex) when (FileSystemRetryPolicy.IsTransient(ex)) { errors.Add(L.F($"{displayPath} : connexion indisponible après trois tentatives. {ex.Message}", $"{displayPath}: connection unavailable after three retries. {ex.Message}")); break; }
+                catch (Exception ex) when (FileSystemRetryPolicy.IsTransient(ex)) { errors.Add(L.F($"{displayPath} : connexion indisponible après trois tentatives. {ex.Message}", $"{displayPath}: connection unavailable after three retries. {ex.Message}")); interrupted = true; break; }
+                catch (IOException ex) when ((ex.HResult & 0xFFFF) is 39 or 112)
+                { errors.Add(L.F($"{displayPath} : espace disque insuffisant. Copie arrêtée ; libérez de la place puis reprenez.", $"{displayPath}: not enough disk space. Copy stopped; free some space, then resume.")); interrupted = true; break; }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or System.ComponentModel.Win32Exception)
                 { errors.Add(L.F($"{displayPath} : {ex.Message}", $"{displayPath}: {ex.Message}")); }
             }
+            // Adding files changes their folders' dates, so folders receive the source's dates last.
+            if (!interrupted)
+                foreach (var item in plan.Items.Where(i => i.Kind == EntryKind.Directory && i.Completed && i.LastWriteUtc != default))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var targetRoot = item.ReverseDirection ? plan.SourceRoot : plan.TargetRoot;
+                    try
+                    {
+                        var target = SafePath(targetRoot, item.RelativePath);
+                        AssertNoLinks(targetRoot, target);
+                        if (item.Attributes is { } attributes) File.SetAttributes(target, attributes == 0 ? FileAttributes.Normal : attributes);
+                        Directory.SetCreationTimeUtc(target, item.CreationUtc);
+                        Directory.SetLastWriteTimeUtc(target, item.LastWriteUtc);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                    { errors.Add(L.F($"{item.RelativePath} : dates du dossier non appliquées. {ex.Message}", $"{item.RelativePath}: folder dates not applied. {ex.Message}")); }
+                }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { cancelled = true; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or System.ComponentModel.Win32Exception) { errors.Add(ex.Message); }
@@ -343,10 +492,14 @@ public sealed class CopyEngine
         if (!FileSafety.IsWithin(root, path)) throw new ArgumentException(L.T("Le chemin de copie sort du dossier choisi.", "The copy path is outside the selected folder."));
         return path;
     }
+    private static bool IsFolder(string path)
+    {
+        var attributes = File.GetAttributes(path);
+        return (attributes & FileAttributes.Directory) != 0 && FileSafety.Access(path, attributes) != EntryAccess.Link;
+    }
     private static void ValidateRoots(CopyPlan plan)
     {
-        if ((File.GetAttributes(plan.SourceRoot) & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != FileAttributes.Directory ||
-            (File.GetAttributes(plan.TargetRoot) & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != FileAttributes.Directory)
+        if (!IsFolder(plan.SourceRoot) || !IsFolder(plan.TargetRoot))
             throw new IOException(L.T("Les racines doivent être des dossiers réels accessibles.", "The roots must be accessible physical folders."));
         var source = FileSafety.CanonicalDirectory(plan.SourceRoot); var target = FileSafety.CanonicalDirectory(plan.TargetRoot);
         if (!source.Equals(plan.SourceCanonical, StringComparison.OrdinalIgnoreCase) || !target.Equals(plan.TargetCanonical, StringComparison.OrdinalIgnoreCase)) throw new IOException(L.T("L’emplacement réel d’un dossier a changé.", "The physical location of a folder has changed."));
@@ -361,7 +514,7 @@ public sealed class CopyEngine
             if (part == ".") continue;
             current = Path.Combine(current, part);
             if (!Exists(current)) continue;
-            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new IOException(L.T("Un lien ou une jonction bloque la copie : ", "A link or junction is blocking the copy: ") + current);
+            if (FileSafety.Access(current, File.GetAttributes(current)) == EntryAccess.Link) throw new IOException(L.T("Un lien ou une jonction bloque la copie : ", "A link or junction is blocking the copy: ") + current);
         }
     }
     private static void EnsureDirectory(string root, string directory)
@@ -373,7 +526,7 @@ public sealed class CopyEngine
             if (part == ".") continue;
             current = Path.Combine(current, part);
             if (!Exists(current)) Directory.CreateDirectory(current);
-            if ((File.GetAttributes(current) & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != FileAttributes.Directory) throw new IOException(L.T("La destination contient un fichier ou un lien à la place d’un dossier : ", "The destination contains a file or link where a folder is required: ") + current);
+            if (!IsFolder(current)) throw new IOException(L.T("La destination contient un fichier ou un lien à la place d’un dossier : ", "The destination contains a file or link where a folder is required: ") + current);
         }
     }
     private static void ValidateCheckpoint(CopyPlan plan, string path)
@@ -386,6 +539,11 @@ public sealed class CopyEngine
         var canonical = Path.Combine(FileSafety.CanonicalDirectory(ancestor), Path.GetRelativePath(ancestor, parent), Path.GetFileName(path));
         if (FileSafety.IsWithin(plan.SourceCanonical, canonical) || FileSafety.IsWithin(plan.TargetCanonical, canonical)) throw new IOException(L.T("Le journal de copie pointe dans un dossier comparé.", "The copy journal points inside a compared folder."));
     }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern bool GetVolumePathNameW(string path, StringBuilder volume, uint length);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern bool GetDiskFreeSpaceExW(string directory, out ulong availableToCaller, out ulong total, out ulong free);
+
     private sealed class ItemState
     {
         public string? PartialName { get; set; }

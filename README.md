@@ -19,4 +19,4 @@ Run `dist\CheckerSan\CheckerSan.exe`. It is standalone: .NET is not needed to ru
 
 ## Limits
 
-Links and junctions are reported, not followed. Permissions and alternate data streams are not compared.
+Links and junctions are reported, not followed. Online-only OneDrive files are never downloaded, so their contents stay unverified. Permissions and alternate data streams are not compared.

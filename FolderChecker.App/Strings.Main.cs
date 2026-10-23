@@ -47,7 +47,7 @@ public static class MainStrings
             ["Main_FilterDifferences"] = ("Tous les écarts", "All differences"),
             ["Main_FilterIdentical"] = ("Identiques / dossiers communs", "Identical / common folders"),
             ["Main_FilterMoved"] = ("Déplacés / renommés", "Moved / renamed"),
-            ["Main_FilterUnverified"] = ("Non vérifiés / erreurs", "Not verified / errors"),
+            ["Main_FilterUnverified"] = ("Non vérifiés, liens, erreurs", "Not verified, links, errors"),
             ["Main_FilterFolders"] = ("Dossiers uniquement", "Folders only"),
             ["Main_SearchTip"] = ("Rechercher un chemin, un nom ou un détail", "Search for a path, name or detail"),
             ["Main_SearchName"] = ("Rechercher dans les résultats", "Search results"),

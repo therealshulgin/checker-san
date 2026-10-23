@@ -25,8 +25,7 @@ public sealed class CopyDialog : Window
         heading.Children.Add(new TextBlock { Text = L.T("Ajoutez les fichiers et dossiers absents de chaque côté, ou choisissez un seul sens. Les originaux restent à leur place et les fichiers existants ne sont jamais écrasés.", "Add missing files and folders on both sides, or choose one direction. Originals stay in place and existing files are never overwritten."), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 16), Foreground = RowView.Brush("#ACACAC") });
         var direction = new ComboBox { Height = 40, DisplayMemberPath = nameof(Choice.Label) };
         RegisterName("DirectionBox", direction);
-        bool canCreate = result is { Cancelled: false, SnapshotVerified: true } && result.Errors.Count == 0 &&
-            result.Rows.All(row => row.Status != ComparisonStatus.Unverified);
+        bool canCreate = result is not null && CopyEngine.CanCreatePlan(result);
         if (canCreate)
         {
             direction.Items.Add(new Choice(L.T("Compléter les deux dossiers (1 ⇄ 2)", "Complete both folders (1 ⇄ 2)"), CopyChoice.Both));
@@ -47,6 +46,8 @@ public sealed class CopyDialog : Window
         RegisterName("ExclusionsText", exclusions);
         heading.Children.Add(exclusions);
         heading.Children.Add(new TextBlock { Text = L.T("Un contenu retrouvé sous un autre nom sera aussi recopié à son chemin manquant, pour compléter l’arborescence.", "Content found under a different name will also be copied to its missing path to complete the folder structure."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#ACACAC"), Margin = new Thickness(0, 0, 0, 12) });
+        var onlineOnly = result?.Rows.Count(row => row.OnlineOnly && row.Status is ComparisonStatus.OnlySource or ComparisonStatus.OnlyTarget) ?? 0;
+        if (onlineOnly > 0) heading.Children.Add(new TextBlock { Text = L.F($"{onlineOnly:N0} fichier(s) disponible(s) uniquement en ligne ne seront pas copiés, pour ne pas les télécharger. Rendez-les disponibles sur cet appareil puis comparez à nouveau pour les inclure.", $"{onlineOnly:N0} online-only file(s) will not be copied, to avoid downloading them. Make them available on this device, then compare again to include them."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#E8C395"), Margin = new Thickness(0, 0, 0, 12) });
         if (canResume) heading.Children.Add(new TextBlock { Text = L.T("Une copie incomplète est enregistrée. Reprenez-la pour conserver son avancement ; lancer une autre copie remplacera son journal.", "An incomplete copy is saved. Resume it to keep its progress; starting another copy replaces its journal."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#E8C395"), Margin = new Thickness(0, 0, 0, 12) });
         DockPanel.SetDock(heading, Dock.Top); panel.Children.Add(heading);
         var footer = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) };
@@ -66,9 +67,13 @@ public sealed class CopyDialog : Window
             try
             {
                 bool resume = choice.Mode == CopyChoice.Resume;
-                var plan = resume ? saved! : await Task.Run(() => choice.Mode == CopyChoice.Both
-                    ? CopyEngine.CreateBidirectionalPlan(result!)
-                    : CopyEngine.CreatePlan(result!, choice.Mode == CopyChoice.Forward));
+                var (plan, needs) = await Task.Run(() =>
+                {
+                    var prepared = resume ? saved! : choice.Mode == CopyChoice.Both
+                        ? CopyEngine.CreateBidirectionalPlan(result!)
+                        : CopyEngine.CreatePlan(result!, choice.Mode == CopyChoice.Forward);
+                    return (prepared, CopyEngine.SpaceNeeds(prepared));
+                });
                 if (version != _version) return;
                 Plan = plan;
                 summary.Text = plan.Bidirectional
@@ -76,7 +81,11 @@ public sealed class CopyDialog : Window
                     : L.F($"Source : {plan.SourceRoot}\nDestination : {plan.TargetRoot}\n{plan.FileCount:N0} fichier(s) · {RowView.FormatSize(plan.TotalBytes)} · {plan.Items.Count(i => i.Kind == EntryKind.Directory):N0} dossier(s)", $"Source: {plan.SourceRoot}\nDestination: {plan.TargetRoot}\n{plan.FileCount:N0} file(s) · {RowView.FormatSize(plan.TotalBytes)} · {plan.Items.Count(i => i.Kind == EntryKind.Directory):N0} folder(s)");
                 list.ItemsSource = plan.Items.Select(i => $"{(i.Completed ? "✓ " : "")}{(plan.Bidirectional ? i.ReverseDirection ? "[2 → 1] " : "[1 → 2] " : "")}[{(i.Kind == EntryKind.Directory ? L.T("Dossier", "Folder") : L.T("Fichier", "File"))}]  {i.RelativePath}").ToList();
                 start.Content = resume ? L.T("Reprendre la copie", "Resume copying") : plan.Bidirectional ? L.T("Compléter les deux dossiers", "Complete both folders") : L.T("Lancer la copie", "Start copying");
-                start.IsEnabled = plan.Items.Count > 0;
+                foreach (var need in needs.Where(need => need.Required > 0))
+                    summary.Text += L.F($"\nEspace libre sur {need.Root} : {L.Size(need.Available)} · nécessaire : {L.Size(need.Required)}", $"\nFree space on {need.Root}: {L.Size(need.Available)} · needed: {L.Size(need.Required)}");
+                var enough = needs.All(need => need.Sufficient);
+                if (!enough) summary.Text += L.T("\nEspace insuffisant : libérez de la place avant de lancer la copie.", "\nNot enough space: free some space before starting the copy.");
+                start.IsEnabled = plan.Items.Count > 0 && enough;
                 if (plan.Items.Count == 0) summary.Text += L.T("\nAucun chemin manquant à copier dans ce sens.", "\nNo missing paths to copy in this direction.");
             }
             catch (Exception ex) { if (version == _version) summary.Text = ex.Message; }

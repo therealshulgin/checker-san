@@ -42,7 +42,7 @@ internal static partial class Program
         ("A locked target file prevents a positive verdict", LockedTargetFile),
         ("Inventory changes during a scan invalidate the snapshot", MutationDuringScan),
         ("A target appearing during hashing invalidates its original missing row", TargetAppearingDuringScan),
-        ("Directory junctions are skipped and prevent positive verdicts", JunctionSkipped),
+        ("Directory junctions are reported and skipped without blocking verdicts", JunctionSkipped),
         ("Junction aliases cannot disguise identical or nested roots", JunctionAliasesRejected),
         ("Cancelled work persists completed hashes for a verified resumed scan", CheckpointCancellationAndResume),
         ("Resume invalidates only a changed same-size file", CheckpointInvalidatesChangedFile),
@@ -67,6 +67,10 @@ internal static partial class Program
         ("Copy journals append item states and recover them after a crash", CopyJournalRecoversAppendedStates),
         ("Copy journal writes stay proportional to the plan size", CopyJournalWritesStayProportional),
         ("Copy progress within a file is limited to ten updates per second", CopyProgressIsThrottledWithinFiles),
+        ("Copies keep the source's dates and attributes, folders included", CopyPreservesDatesAndAttributes),
+        ("A copy that cannot fit stops before writing anything", CopyRefusesWithoutFreeSpace),
+        ("Online-only cloud files are compared by metadata and never read", OnlineOnlyFilesAreNeverRead),
+        ("Online-only cloud files are left out of duplicate groups", DuplicateOnlineOnlyFilesAreSkipped),
         ("One synchronization fills missing files and empty directories on both sides", SyncCompletesBothTrees),
         ("Synchronization restores absent paths even when their content exists elsewhere", SyncRestoresMovedPaths),
         ("One-way copies restore moved paths in either chosen direction", SyncOneWayMovedPaths),
@@ -541,9 +545,20 @@ internal static partial class Program
         await CreateJunction(junction, unrelated);
         Check((File.GetAttributes(junction) & FileAttributes.ReparsePoint) != 0, "fixture is a junction");
         var result = await Compare(w);
-        AssertUncertain(result);
+        Check(result.SnapshotVerified && result.Errors.Count == 0, "a junction is reported, not an error: " + string.Join("; ", result.Errors));
+        Equal(ComparisonStatus.Skipped, result.Rows.Single(r => r.RelativePath == "linked").Status, "junction row is skipped");
+        Check(result.SourceFullyContained && result.TargetFullyContained, "a link is not content, so it does not block either verdict");
+        Equal(1L, result.SourceFileCount, "links are not counted as files");
         Check(result.Rows.All(r => !Normalize(r.RelativePath).Contains("must-not-follow", StringComparison.Ordinal)),
             "scanner must not traverse junction destination");
+
+        // A real folder facing that link is not contained: its files are not compared through the link.
+        w.FileAt(w.Target, "linked/real.wav", "only reachable through the link in folder 1");
+        var facing = await Compare(w);
+        Check(facing.SnapshotVerified && facing.Errors.Count == 0, "facing a link is not an error");
+        Equal(ComparisonStatus.Skipped, facing.Rows.Single(r => Normalize(r.RelativePath) == "linked/real.wav").Status, "path under a link is skipped");
+        Check(facing.SourceFullyContained && !facing.TargetFullyContained, "the real folder in folder 2 is not contained in folder 1");
+        Equal(0, CopyEngine.CreatePlan(facing, false).Items.Count, "nothing is ever copied through a link");
     }
 
     private static async Task TargetAppearingDuringScan()

@@ -19,4 +19,14 @@ public static class L
 
     public static string T(string french, string english) => IsEnglish ? english : french;
     public static string F(FormattableString french, FormattableString english) => (IsEnglish ? english : french).ToString(Culture);
+
+    /// <summary>Binary units: B/KiB/MiB… in English, o/Kio/Mio… in French.</summary>
+    public static string Size(long bytes)
+    {
+        double n = bytes;
+        string[] units = IsEnglish ? ["B", "KiB", "MiB", "GiB", "TiB", "PiB"] : ["o", "Kio", "Mio", "Gio", "Tio", "Pio"];
+        var i = 0;
+        while (n >= 1024 && i < units.Length - 1) { n /= 1024; i++; }
+        return n.ToString(i == 0 ? "N0" : "N1", Culture) + " " + units[i];
+    }
 }

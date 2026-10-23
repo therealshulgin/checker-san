@@ -229,7 +229,8 @@ internal static partial class Program
         var result = await new DuplicateEngine().ScanAsync(w.Source, DuplicateOptions());
         Equal(1L, result.FilesScanned, "junction target was not traversed");
         Equal(0, result.Groups.Count, "external duplicate is not included");
-        Check(!result.SnapshotVerified && result.Errors.Count > 0, "skipped links are explicit");
+        Check(result.SnapshotVerified && result.Errors.Count == 0, "a skipped link does not block removal: " + string.Join("; ", result.Errors));
+        Check(result.Warnings.Any(warning => warning.Contains("external", StringComparison.Ordinal)), "skipped links are reported");
     }
 
     private static async Task DuplicateHardLinksDoNotInflateSavings()
