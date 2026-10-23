@@ -1,3 +1,4 @@
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using FolderChecker.Core;
@@ -45,8 +46,12 @@ public sealed class DuplicateRemovalDialog : Window
             var kept = group.Files.Where(file => !chosen.Contains(file.FullPath)).ToArray();
             valid &= kept.Length > 0;
             lines.Add(L.T("SHA-256 : ", "SHA-256: ") + group.Hash);
-            lines.AddRange(group.Files.Where(file => chosen.Contains(file.FullPath)).Select(file => L.T("RETIRER   ", "REMOVE   ") + file.FullPath));
-            lines.AddRange(kept.Select(file => L.T("CONSERVER   ", "KEEP   ") + file.FullPath));
+            // The read-only attribute is often a deliberate protection: say it is overridden before anyone confirms.
+            lines.AddRange(group.Files.Where(file => chosen.Contains(file.FullPath)).Select(file => L.T("RETIRER   ", "REMOVE   ") + file.FullPath +
+                ((file.Attributes & FileAttributes.ReadOnly) != 0 ? L.T("   (en lecture seule)", "   (read-only)") : "")));
+            // A copy in a quarantine is set aside, not kept: the removal refuses such a group.
+            lines.AddRange(kept.Select(file => L.T("CONSERVER   ", "KEEP   ") + file.FullPath +
+                (DuplicateRemoval.IsInQuarantine(file.RelativePath) ? L.T("   (dans une mise à l’écart)", "   (in a quarantine)") : "")));
             lines.Add("");
         }
         var preview = new TextBox { IsReadOnly = true, Text = string.Join(Environment.NewLine, lines), TextWrapping = TextWrapping.Wrap, VerticalContentAlignment = VerticalAlignment.Top, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };

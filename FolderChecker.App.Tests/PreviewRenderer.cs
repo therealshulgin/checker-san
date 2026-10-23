@@ -43,6 +43,18 @@ internal static partial class Program
         Render(duplicates, "duplicates", 1100, 850);
         var small = DuplicateUiWindow();
         Render(small, "duplicates-small", 850, 620);
+        Render(new SnapshotWindow(@"C:\Users\Photos"), "snapshots", 860, 600);
+        var store = Path.Combine(Path.GetTempPath(), "checkersan-preview-" + Guid.NewGuid().ToString("N"), "pairs.json");
+        try
+        {
+            var photos = PairStore.Save(new SavedPair { Name = "Photos ⇄ Sauvegarde", Folder1 = @"C:\Users\Photos", Folder2 = @"G:\Sauvegarde\Photos",
+                Schedule = new PairSchedule(ScheduleFrequency.Weekly, DayOfWeek.Sunday, new TimeOnly(12, 0)) }, store);
+            PairStore.RecordRun(photos.Id, new PairRun(new DateTimeOffset(2026, 10, 19, 12, 4, 0, TimeSpan.FromHours(2)), ExitCodes.Differences, 3, 0, 0, @"C:\reports\r.json"), store);
+            PairStore.Save(new SavedPair { Name = "Documents ⇄ NAS", Folder1 = @"C:\Users\Documents", Folder2 = @"\\NAS\Documents" }, store);
+            Render(new PairsWindow(@"C:\Users\Musique", @"G:\Sauvegarde\Musique", true, store, @"C:\Apps\CheckerSan.exe"), "pairs", 900, 760);
+            Render(new ScheduledResultWindow(PairStore.Load(store)[0], PairStore.Load(store)[0].LastRun!), "scheduled-result", 660, 330);
+        }
+        finally { Directory.Delete(Path.GetDirectoryName(store)!, recursive: true); }
         var filters = DuplicateUiWindow();
         DupControl<Expander>(filters, "FiltersExpander").IsExpanded = true;
         Render(filters, "duplicates-filters", 1100, 980);

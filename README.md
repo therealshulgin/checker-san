@@ -6,6 +6,9 @@ Windows 11 app that checks whether two folders contain the same files, and finds
 - **Complete** either folder with its missing files. Nothing is overwritten or deleted.
 - **Find duplicates** with size and name filters, pick copies by hand or by rule, then send them to the Recycle Bin or a restorable quarantine, or delete them. Every action is journaled.
 - Stop and resume scans and copies at any time.
+- **Snapshots:** record every file's SHA-256 and check a disconnected backup against it later.
+- **Saved pairs:** let Windows Task Scheduler check two folders daily or weekly. Checker San stays silent unless a difference is proven or the check is incomplete.
+- **Command line:** `checkersan-cli compare | snapshot | verify | duplicates | pairs | run`, with exit codes 0 (clean), 1 (differences), 2 (incomplete), 3 (error). It never changes files; `--simulate-copy` and `--simulate-keep` list what a copy or a removal would do.
 
 ## Build
 

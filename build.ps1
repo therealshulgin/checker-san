@@ -24,10 +24,15 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Restore failed.' }
     & $dotnetCommand publish '.\FolderChecker.App\FolderChecker.App.csproj' -c Release -r win-x64 --self-contained true --no-restore -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o '.\dist\CheckerSan'
     if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
+    # The command line for scheduled checks, standalone like the application.
+    & $dotnetCommand restore '.\FolderChecker.Cli\FolderChecker.Cli.csproj' -r win-x64 --source 'https://api.nuget.org/v3/index.json' -p:PublishSingleFile=true -p:SelfContained=true
+    if ($LASTEXITCODE -ne 0) { throw 'Restore failed: command line.' }
+    & $dotnetCommand publish '.\FolderChecker.Cli\FolderChecker.Cli.csproj' -c Release -r win-x64 --self-contained true --no-restore -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o '.\dist\CheckerSan'
+    if ($LASTEXITCODE -ne 0) { throw 'Publish failed: command line.' }
     Copy-Item -LiteralPath '.\README.md' -Destination '.\dist\CheckerSan\Mode-emploi.md' -Force
     # Package only the intended deliverables; leave any user-added archives untouched.
-    Compress-Archive -LiteralPath @('.\dist\CheckerSan\CheckerSan.exe', '.\dist\CheckerSan\Mode-emploi.md') -DestinationPath '.\dist\CheckerSan-Windows-x64.zip' -Force
-    Get-FileHash -LiteralPath '.\dist\CheckerSan\CheckerSan.exe' -Algorithm SHA256 | Format-List
-    Write-Output 'Prêt : dist\CheckerSan\CheckerSan.exe et dist\CheckerSan-Windows-x64.zip'
+    Compress-Archive -LiteralPath @('.\dist\CheckerSan\CheckerSan.exe', '.\dist\CheckerSan\checkersan-cli.exe', '.\dist\CheckerSan\Mode-emploi.md') -DestinationPath '.\dist\CheckerSan-Windows-x64.zip' -Force
+    Get-FileHash -LiteralPath @('.\dist\CheckerSan\CheckerSan.exe', '.\dist\CheckerSan\checkersan-cli.exe') -Algorithm SHA256 | Format-List
+    Write-Output 'Prêt : dist\CheckerSan\CheckerSan.exe, dist\CheckerSan\checkersan-cli.exe et dist\CheckerSan-Windows-x64.zip'
 }
 finally { $env:APPDATA = $originalAppData }

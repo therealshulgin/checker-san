@@ -189,7 +189,7 @@ Journal par défaut :
 - Vérification SHA-256 complète de la copie avant renommage sans écrasement. Le journal permet de traiter une interruption entre validation et finalisation.
 - **Journal incrémental (22 octobre 2026).** `copy.json` est un fichier JSON Lines : la première ligne est le plan complet (schéma 1 ou 2, inchangé) ; chaque ligne suivante est le dernier état d’un élément (`Completed`, `VerifiedHash`, `PartialIdentity`, `DestinationIdentity`), identifié par son `PartialName`, désormais unique dans tout le plan. Le plan n’est réécrit (temporaire + `Flush(true)` + remplacement) qu’au démarrage, lorsque les états ajoutés atteignent un quart de sa taille (minimum 1 Mio), et à l’arrêt. Un arrêt normal, une annulation ou une erreur laissent donc une seule ligne, lisible par les versions précédentes. Auparavant, le plan entier était réécrit et forcé sur disque trois fois par fichier, d’où un coût quadratique : 2 000 petits fichiers prenaient 93,8 s, contre 9,0 s maintenant (environ 4,5 ms par fichier, constant jusqu’à 5 000 fichiers). Cette réécriture continuelle provoquait aussi des « Accès refusé » sporadiques, probablement dus à l’antivirus.
 - Chaque état ajouté est transmis au cache système, ce qui survit à un plantage de l’application ; il n’est forcé sur disque qu’au plus une fois par seconde. Une coupure de courant peut donc perdre les derniers états : la reprise refuse alors les éléments concernés (destination existante sans empreinte, temporaire non identifié) au lieu de les accepter ou de les écraser. Une nouvelle comparaison les classe ensuite normalement. `ReadPlan` ignore une ligne illisible, tronquée, inconnue ou à l’empreinte invalide ; l’élément garde alors son état précédent. Les données de chaque copie restent forcées sur disque avant le renommage final.
-- **Vérification, dates et espace (22 octobre 2026).** La relecture SHA-256 de la copie passe par un nouveau handle `FILE_FLAG_NO_BUFFERING`, avec un tampon aligné sur 64 Kio et des lectures arrêtées à la longueur du fichier. Elle lit donc le disque ou le partage, pas le cache de Windows. Si le périphérique refuse ces lectures (erreur 87), la relecture repasse par le cache. Ce handle interdit l’écriture jusqu’au renommage final, que `FileShare.Delete` autorise.
+- **Vérification, dates et espace (22 octobre 2026).** La relecture SHA-256 de la copie passe par un handle `FILE_FLAG_NO_BUFFERING`, avec un tampon aligné sur 64 Kio et des lectures arrêtées à la longueur du fichier. Elle lit donc le disque ou le partage, pas le cache de Windows. Si le périphérique refuse ces lectures (erreur 87), la relecture repasse par le cache. Depuis le lot vitesse, c’est le même handle qui écrit, vérifie et renomme le fichier (voir « Lot vitesse »).
 - Les dates de création et de modification sont fixées sur le handle d’écriture avant `Flush(true)`. Les attributs lecture seule, caché, système, archive et non indexé (`CopyItem.Attributes`, null dans les anciens journaux) sont appliqués après le renommage, pour qu’un temporaire en lecture seule ne bloque pas une reprise. Les dossiers reçoivent leurs dates et attributs dans une passe finale, car l’ajout de fichiers modifie leurs dates.
 - `CopyEngine.SpaceNeeds` additionne, par volume de destination, les fichiers non terminés moins leurs temporaires, arrondis à 4 Kio par fichier (`GetDiskFreeSpaceExW`, compatible avec les partages). Un manque bloque la copie avant toute écriture et désactive le bouton du dialogue. Un disque plein en cours de copie (erreurs 39/112) arrête la boucle au lieu d’échouer fichier par fichier. `GetVolumePathNameW` remonte tout le chemin : il n’est appelé qu’une fois par racine. L’appeler par fichier doublait le temps de copie.
 - Coût mesuré de ces contrôles : environ 0,2 ms par petit fichier (4,6 ms contre 4,3 à 4,6 ms pour l’ancien moteur, en alternance sur 1 000 fichiers).
@@ -268,6 +268,228 @@ Les fixtures restent sous `.test-data/ui-general`. Les deux journaux `%LOCALAPPD
 L’automatisation native de l’interface a utilisé le skill `computer-use` et `@oai/sky` via le REPL Node. Pour la reprendre, relire les instructions disponibles dans la nouvelle session et sélectionner une fenêtre actuelle ; les anciens identifiants de fenêtres et index de contrôles sont périmés.
 
 La livraison précédente ajoutait la copie bidirectionnelle en une opération et la palette noire/grise. Ses 85 tests automatisés passaient, dont les trois choix du dialogue et la reprise dans le second sens. Le lancement pour contrôle visuel a été interrompu par l’utilisateur avec la touche Échap : aucune autre automatisation native n’a été effectuée ensuite et le contrôle visuel de cette dernière palette reste à faire. Les fixtures créées à cet effet se trouvent dans `.test-data/ui-sync-4065442190d649a7800d6f0ed5c76e18` ; aucun scan ni transfert n’a été lancé dessus depuis l’interface. Les journaux de session étaient absents avant cette tentative.
+
+## Revue adverse et lot A « verdicts justes » — 23 octobre 2026 (non commité, au-dessus du lot automatisation)
+
+Revue complète dans `revue/` :
+- `REVUE-ROUGE.md` : 39 trouvailles prouvées ;
+- `REVUE-BLEUE.md` : réfutations et avis sur les correctifs ;
+- `ARBITRAGE.md` : gravité finale, correctif retenu et plan en trois lots.
+
+Aucune trouvaille n'est réfutée sur le fond. Le lot A est fait ; les lots B (écritures et retraits au bon endroit) et C (robustesse) restent à faire.
+- **CMP-01, élément réel face à un lien.** `ExitCodes.ForComparison` rend 2, et non 0, quand `TreesIdentical` est faux sans aucune ligne d'écart : un dossier réel face à une jonction, dans un sens comme dans l'autre. Des liens identiques des deux côtés restent à 0.
+  - `PairRun.Links` compte les éléments derrière des liens, affichés par la liste des paires et la fenêtre de résultat.
+  - Le CLI ajoute une ligne d'explication, et son aide décrit le code 2.
+  - L'aide de l'app disait que les liens « n'empêchent pas le verdict » ; elle est corrigée en FR et en EN.
+- **CMP-02, contrôle final.** Après le dernier inventaire, `VerifyReadIdentitiesAsync` réinterroge par handle (`FileSafety.CurrentIdentity` : `FILE_READ_ATTRIBUTES`, sans suivre de lien) chaque fichier qui fonde une ligne Identique ou Déplacé. Une identité (volume, identifiant, `ChangeTime`) différente ou devenue illisible donne une erreur et la ligne passe en `Unverified`.
+  - Cas couverts : écriture en place avec date remise, et écriture par un autre lien physique, que l'entrée de répertoire ne reflète pas.
+  - Même contrôle dans `SnapshotEngine`.
+  - Une identité absente dès la lecture (système de fichiers sans identifiant) laisse le comportement inchangé.
+  - **Coût mesuré** sur 10 000 fichiers de 1 Kio par côté, NVMe, trois passages en alternance : médiane 3,20 s → 3,34 s (+4 %) avec les lecteurs par disque. En séquentiel, c'était +43 % ; d'où la parallélisation.
+- **AUT-02, `verify` et dossiers illisibles.**
+  - Nouveau champ facultatif `FolderSnapshot.UnreadableFolders` ; le schéma 1 reste lisible.
+  - `Compare` ne produit ni « absent » ni « ajouté » sous un dossier illisible, au moment de l'instantané comme au moment de la vérification.
+  - `verify` place les erreurs avant les écarts (code 2), comme `compare` : un fichier seulement en ligne ne masque pas un écart prouvé (code 1).
+  - Les erreurs sont affichées dans le CLI et dans la fenêtre d'instantanés.
+- **Même dossier sous deux noms.** `ValidateSeparateRoots` compare aussi le volume et l'identifiant (`FileSafety.ObjectId`) des deux racines et de leurs ancêtres. Cela vise par exemple un NAS désigné par son nom puis par son adresse, que les chemins canoniques ne rapprochent pas. Non testable ici sur un vrai partage ; le mécanisme est testé avec une jonction, par réflexion.
+- **DUP-07, noms d'un caractère.** `RenameByHandle` transmet au moins `sizeof(FILE_RENAME_INFORMATION)`, soit 24 octets en x64. Un fichier nommé `a` est de nouveau copié et mis à l'écart.
+- **CMP-05, casse dans les instantanés.** Deux noms distincts seulement par la casse, dans un dossier sensible à la casse, donnent une erreur et un instantané incomplet. Le hachage passe par le nom énuméré.
+- **Tests :** 6 nouveaux, dans `FolderChecker.Tests/VerdictFixTests.cs`, qui reprennent les scénarios prouvés par la revue. **140 tests moteur réussis trois fois de suite, 37 tests WPF réussis deux fois.**
+
+### Lot B « écritures et retraits au bon endroit » — 23 octobre 2026 (non commité, au-dessus du lot A)
+- **Une seule vérification des sorties** : `OutputFiles` (Core, publique). `EnsureOutside` vérifie, `CreateOutside` vérifie puis crée.
+  - Refus : nom contenant `:` (flux NTFS d'un dossier), dossier parent absent, fichier existant, destination dans une racine. Le contrôle est textuel puis canonique ; il couvre les jonctions et le préfixe `\\?\`.
+  - Utilisateurs : rapports, exports de doublons et aperçus de copie de l'app (`ReportWriter.CreateOutside` délègue), `SnapshotEngine.Save` et le `--json` du CLI.
+  - Le CLI vérifie `--json` et la destination de l'instantané **avant** le scan ; la fenêtre d'instantanés aussi (`SnapshotEngine.ValidateDestination`). `ValidateCheckpointPath` refuse aussi `:`.
+- **Rapports des paires** :
+  - le dossier réellement écrit, `Reports\<id>`, est contrôlé de façon canonique contre les racines ;
+  - le nom est en culture invariante, donc en chiffres grégoriens ;
+  - deux vérifications dans la même seconde donnent `…-2.json` ;
+  - la rotation ne touche que les noms `^\d{4}-\d{2}-\d{2} \d{6}(-\d{1,2})?\.json$` et épargne le rapport qui vient d'être écrit.
+- **Doublons** :
+  - **Quarantaine imbriquée.** Une quarantaine reconnue est exclue de l'inventaire à toute profondeur, avec un avertissement qui la nomme. `DuplicateSelection.Extras` ne garde jamais une copie située sous un dossier `.CheckerSan-Quarantine` (`DuplicateRemoval.IsInQuarantine`).
+  - **Refus par groupe.** `BuildPlan` refuse le seul groupe concerné (sélection en quarantaine, ou seule copie conservée en quarantaine) au lieu de bloquer tout le plan. `ValidatePath` ne fait plus que vérifier la forme des chemins. L'aperçu marque une ligne CONSERVER située dans une quarantaine.
+  - **Corbeille.** Pendant la vérification d'un groupe, aucun mode ne partage plus la suppression : un fichier vérifié ne peut plus être renommé puis remplacé. Avant l'appel au Shell, un second handle (attributs seuls, partage complet) doit désigner le même fichier au même endroit (`FileIdInfo` et chemin final). Le handle verrouillé n'est relâché qu'ensuite, quelques microsecondes avant l'appel. Le résultat est lu sur ce second handle, et un déplacement inattendu est inscrit au journal comme incident.
+  - **Disponibilité de la Corbeille.** `RecycleBinAvailable` juge maintenant le volume réel (chemin canonique, puis `GetVolumePathNameW`), y compris derrière une jonction, un lecteur `subst` ou un point de montage. Un chemin pas encore accessible est jugé d'après sa lettre.
+  - **Restauration par handle.** La session et la quarantaine sont épinglées (`DirectoryLocks`, liens refusés). Chaque fichier est ouvert sans suivre de lien : fichier simple, un seul nom, chemin final exact. Son SHA-256 est relu sur ce handle, puis il est renommé par handle vers son dossier d'origine, épinglé ou créé. Une session ou un manifeste qui sont des liens ne sont ni proposés ni restaurés, et `RemoveEmptyFolders` ne descend jamais dans un lien, racine comprise.
+- **Copie** :
+  - **COP-01.** Le chemin final est contrôlé sur le handle du temporaire juste après son ouverture ; un temporaire créé ailleurs est supprimé par son handle. Même contrôle sur la destination existante et sur le dossier du renommage. La passe finale des dossiers revalide les racines, épingle chaque dossier par un handle sans partage de suppression, contrôle son chemin final, puis applique les dates par handle et les attributs.
+  - **Identité des racines.** `CopyPlan.SourceRootId`/`TargetRootId` contiennent le volume et l'identifiant ; nul dans les anciens journaux. Un disque de sauvegarde échangé sous la même lettre, ou un dossier recréé, est refusé.
+  - **COP-08.** `CopyItem.CreatedByCopy` : un dossier qui existait déjà garde ses attributs et ses dates. Le drapeau est collant à la reprise ; nul dans les anciens journaux, qui gardent leur comportement.
+  - **COP-09.** Une reprise applique les attributs d'une copie renommée mais jamais marquée terminée.
+  - **COP-07.** Les temporaires `.checkersan-….partial` abandonnés sont écartés du plan, comptés dans `CopyPlan.AbandonedTemporaries` et annoncés dans l'aperçu. La comparaison les nomme dans le détail, sans les masquer.
+  - **Source en ligne uniquement.** Une source devenue « en ligne uniquement » depuis le plan est refusée avant toute lecture.
+- **Écart avec l'arbitrage, voulu.** DUP-02 prévoyait une ligne d'intention au journal avant l'appel au Shell. Le second handle réduit la fenêtre d'échange à quelques microsecondes. Je garde donc « une ligne par action » (même choix que pour DUP-04), avec une ligne d'incident en cas de déplacement inattendu.
+- **Vérification par les reproductions de la revue.** Les programmes de l'équipe rouge ont été relancés sur les nouvelles DLL, avec des données temporaires depuis supprimées.
+  - Copie : `oplock` (échange de la racine minuté par un oplock, que les tests ne savent pas reproduire), `folderpass`, `existingdir`, `resumeattrs`, `partials`.
+  - Doublons : `nested`, `onechar`, `restorejunction`.
+  - Rapports des paires : `reports-inside`, `culture`.
+  - Comparaison : `linkexit`, `finalcheck`, `clijson`, `snapcase`, `ads`.
+  - Résultat : tous montrent le refus ou le bon comportement, là où ils prouvaient le défaut.
+- **Coût mesuré** : copie de 1 000 fichiers de 4 Kio, NVMe, trois passages en alternance : médiane 4,22 s avant, 4,09 s après. Aucune différence mesurable.
+- **Tests :** 6 nouveaux dans `FolderChecker.Tests/WriteSafetyTests.cs`. Le test d'échange en mode Corbeille s'arrête avant l'appel au Shell : rien n'est mis dans la vraie Corbeille. **146 tests moteur réussis trois fois de suite, 37 tests WPF réussis deux fois.**
+
+### Lot C « robustesse » — 23 octobre 2026 (non commité, au-dessus du lot B)
+- **Ligne de commande** :
+  - **AUT-10.** Liste blanche des options par commande ; les options communes (`--lang`, `--log`, `--readers`, `--pairs`) sont acceptées partout. Une option inconnue, ou propre à une autre commande, donne le code 3 avant tout scan. Une valeur qui commence par `--` est refusée. Les drapeaux ignorent la casse. `--help` avec une commande garde le code 0.
+  - **AUT-04.** Ctrl+C donne le code 2, avec un message et une ligne d'activité. Un filet final garantit l'un des quatre codes pour toute exception imprévue.
+  - **AUT-05.** `--log ""` est refusé (code 3). `ActivityLog.Write` est entièrement protégé : un chemin vide, une racine ou un dossier ne font jamais échouer l'opération.
+  - **Chemins longs.** Le CLI a désormais un `app.manifest` `longPathAware`.
+- **Paires** :
+  - **AUT-06.** `PairStore.Modify(id, change)` modifie sous le verrou la paire telle qu'elle est dans le fichier. Planifier ou déplanifier garde donc un résultat enregistré entre-temps par une vérification.
+  - **AUT-07.** Supprimer une paire interroge toujours la tâche Windows, puis la retire. Si l'enregistrement échoue après la création de la tâche, la tâche est retirée. « Ne plus planifier » est actif pour toute paire sélectionnée.
+  - **Chemins et verrou.** `Save` refuse un chemin relatif, qu'une tâche résoudrait depuis System32. Le mutex de la liste porte le nom du chemin canonique, donc deux écritures du même fichier partagent le même verrou.
+- **Mode planifié (AUT-01)** :
+  - le processus `--scheduled` se termine toujours juste après la vérification, avec son code ;
+  - s'il y a quelque chose à signaler, il lance `CheckerSan.exe --show-result <id>` dans un processus séparé, ramené à la priorité normale, avec une seule fenêtre par paire (mutex `Local\CheckerSan-result-<id>`) ;
+  - « Ouvrir dans Checker San » lance un processus normal `--pair <id>`, qui charge la paire ; le lanceur est injectable pour les tests ;
+  - une fenêtre laissée ouverte ne retient donc plus la tâche : Windows ne saute plus de vérification (`IgnoreNew`), la limite de 72 h ne ferme plus l'app, et le dernier résultat du Planificateur est le bon code ;
+  - **vérifié en lançant l'exécutable Release à la main**, sans le Planificateur : avec un écart, code 1 en 0,44 s et fenêtre de résultat dans un processus séparé à priorité normale ; dossiers identiques, code 0 en 0,44 s et aucune fenêtre ;
+  - **essai réel avec le Planificateur, fait le 23 octobre avec l'accord de l'utilisateur.** Tâche temporaire créée par `ScheduledTasks.Register`, sur deux dossiers d'essai qui diffèrent, avec une version autonome publiée hors de `dist`.
+    - `schtasks /Run` : la tâche se termine en 2 s avec le dernier résultat 1 et revient à l'état « Prêt ».
+    - Dix secondes après la fin de la tâche, la fenêtre de résultat est toujours ouverte dans son propre processus, à priorité normale. Elle ne prend pas le focus et affiche la paire, ses dossiers et « differences are proven ». L'objet job de la tâche ne la ferme donc pas.
+    - Ensuite : fenêtre fermée, tâche supprimée par `ScheduledTasks.Unregister` (plus aucune tâche « Checker San »), dossiers d'essai supprimés.
+- **Doublons** :
+  - **DUP-08.** La suppression définitive passe par `FileDispositionInfoEx` avec `IGNORE_READONLY` (repli sur la classe 4). L'aperçu marque les fichiers en lecture seule.
+  - **Refus par groupe.** Un refus propre à un groupe (contenu changé, liens physiques, lien sur le chemin, refus de Windows) n'arrête plus que ce groupe. Seuls le journal et la quarantaine arrêtent tout (`StopAll`).
+  - **DUP-04.** Un retrait est compté avant sa ligne de journal. Si le journal ne peut plus être écrit, l'erreur « retiré sans ligne au journal : <chemin> » est inscrite et les actions suivantes ne sont pas faites. Manifeste et journal sont fermés séparément, sans jamais masquer le résultat ; même protection pour la restauration.
+  - **DUP-06.** Le manifeste enregistre `CanonicalRoot`. Une mise à l'écart se restaure sous une autre écriture du même dossier (lecteur mappé, jonction plus haut), et `QuarantineSessions` n'offre que les sessions que `Restore` acceptera. Le message de refus donne la racine d'origine.
+- **Réutilisation des empreintes (CMP-03, DUP-05).** Elle n'a lieu que sur NTFS ou ReFS (`FileSafety.KeepsChangeTime`, partage compris). Sur FAT32 ou exFAT tout est relu, avec un avertissement. L'aide dit maintenant que la réutilisation fait confiance aux métadonnées et ne détecte ni leur falsification délibérée ni une corruption silencieuse.
+- **Copie** :
+  - **COP-02.** La marque du Web (`Zone.Identifier`) est copiée au mieux. Le flux doit être ouvert en partageant la suppression, car le temporaire ouvert la détient. Les autres flux et les autorisations ne sont pas copiés : c'est dit dans l'aide et dans le dialogue.
+  - **COP-03.** Après une copie 2 → 1, les champs Dossier 1 et Dossier 2 restent en place.
+  - **COP-04.** L'espace est calculé avec la vraie taille de cluster du volume (`GetDiskFreeSpaceW`) plus un cluster par dossier à créer.
+  - **COP-06.** Un nom que Windows modifierait (point ou espace final, nom réservé, demi-paire UTF-16) est écarté du plan avec un compteur (`UnsupportedNames`), au lieu de faire échouer tout le plan.
+  - **COP-10.** Un journal impossible à rouvrir arrête la copie avec un message clair (`JournalUnavailable`), sans `NullReferenceException`. Le journal reste lisible et la copie reprenable : vérifié en rejouant la reproduction rouge `nre`.
+  - **Erreur 87.** Si l'ouverture sans cache est refusée, le temporaire est rouvert avec cache. Non testable ici.
+- **Comparaison** :
+  - **CMP-06.** `FileSafety.Native` passe à Windows `\\?\…` (ou `\\?\UNC\…`) pour tous nos appels natifs, ainsi que pour les lectures de la comparaison et des instantanés. Il en résulte : pas de limite de 260 caractères même sans `LongPathsEnabled`, et un nom à point ou espace final conservé. Le chemin relatif est découpé tel qu'énuméré (`FileSafety.RelativeTo`), au lieu de `GetRelativePath` qui retirait le point ou l'espace final. Le moteur de doublons garde son ancienne lecture pour ces noms rares.
+  - **CMP-07.** Une sauvegarde du fichier de reprise attend que le nombre d'empreintes ait crû d'un quart (ou 5 minutes au plus, ce que peut perdre un plantage), et au moins 20 fois sa propre durée. « Arrêter et garder » sauvegarde toujours aussitôt. La limite de lecture passe de 128 Mio à 1 Gio, et la fenêtre lit le fichier de reprise hors du thread d'interface. **Mesuré** avec la reproduction rouge `ckptcost` (2 × 10 000 fichiers, disque lent simulé à 10 ms par fichier, un lecteur) : 1,54 Go écrits pour un fichier final de 10,6 Mo (146 fois) avant, 59,8 Mo (5,7 fois) après. Durée 321 s avant, 311 s après. Une première version limitée à « 20 fois la durée » ne réduisait pas le volume, d'où cette règle.
+  - **CMP-10.** `SnapshotEngine.Load` refuse un instantané qui se contredit : chemins en double, ou « complet » malgré des fichiers non vérifiés ou des erreurs.
+  - **CMP-11.** Une différence de casse seule est écrite dans le détail de la ligne. Dans un dossier sensible à la casse, la ligne devient un conflit, donc les arborescences ne sont pas identiques.
+- **Tests :** 6 nouveaux tests moteur (`FolderChecker.Tests/RobustnessTests.cs`), 1 nouveau test WPF, et deux tests WPF adaptés : bouton « Ne plus planifier », lanceur de la fenêtre de résultat, résultat conservé à la planification. **152 tests moteur réussis trois fois de suite, 38 tests WPF réussis deux fois.**
+
+### Distribution reconstruite — 23 octobre 2026, 20:54
+- `build.ps1 -Test` : 152 tests moteur et 38 tests WPF réussis, puis publication autonome de `dist\CheckerSan\CheckerSan.exe` et `checkersan-cli.exe`, avec `Mode-emploi.md` (copie du README) et `dist\CheckerSan-Windows-x64.zip`. Le fichier `CheckerSan.rar` de l'utilisateur, dans `dist\CheckerSan`, n'a pas été touché.
+- SHA-256 :
+  - `CheckerSan.exe` : `BEA85D7D8BC873BE62F8446BF93547C4CDFA05B7B28F562066648CD8CA0169E1` ;
+  - `checkersan-cli.exe` : `A35E48E418095E43C04469C2FCFD760552020FF63C122AA2CE4C317727132EAE`.
+- Contrôle : `checkersan-cli.exe` publié tourne sans le SDK local, et son aide s'affiche avec les accents.
+- **Correctif découvert en route.** Au premier passage de `build.ps1`, le test « Resume invalidates only a changed same-size file » a échoué une fois : 1 empreinte réutilisée au lieu de 5. Il passe ensuite 15 fois sur 15 isolé. Cause la plus probable : la sauvegarde forcée de fin de scan échoue quand l'antivirus garde encore ouverte la copie précédente. Une seule sauvegarde avait alors eu lieu, la première, depuis que le lot C espace les sauvegardes. Le remplacement du fichier de reprise est désormais réessayé quatre fois (100 à 400 ms) lors de cette sauvegarde de fin. Le test affiche maintenant les avertissements de sauvegarde s'il échoue à nouveau.
+
+## Lot automatisation — terminé le 23 octobre 2026 (non commité, au-dessus du lot vérification à distance)
+
+Demande : « Lot suivant », après les quatre lots proposés. Choix : fin de la section architecture de la veille, paires enregistrées et planification (20), simulation (22). Restent hors lots : 8, 10, 11, 12, 15, 17.
+- **Paires enregistrées** (`FolderChecker.Core/SavedPairs.cs`).
+  - `SavedPair` : identifiant de 8 chiffres hexadécimaux, nom unique sans tenir compte de la casse, deux dossiers, option des déplacements, `PairSchedule` (chaque jour ou chaque semaine, à une heure locale) et `PairRun`, le dernier résultat. Ce résultat garde des compteurs et non du texte, pour s’afficher dans les deux langues.
+  - `PairStore` : `%LOCALAPPDATA%\CheckerSan\pairs.json`, schéma 1. Chaque modification relit le fichier sous un mutex de session `Local\CheckerSan-pairs-…`, partagé par l’app, la ligne de commande et les vérifications planifiées, puis le remplace en une fois (fichier temporaire puis `File.Move` avec remplacement). Un fichier endommagé lève `InvalidDataException` et n’est jamais réécrit.
+  - `PairCheck.RunAsync` : comparaison en lecture seule, puis rapport JSON compact dans `Reports\<id>\aaaa-mm-jj hhmmss.json`. Les fichiers identiques et les dossiers communs y sont seulement comptés. Seuls les 20 derniers rapports par paire sont gardés. Le rapport est refusé s’il tomberait dans un dossier comparé. Le résultat est enregistré avec la paire et dans le journal d’activité.
+  - `ExitCodes` (Core) centralise les codes 0/1/2/3, utilisés par la ligne de commande et le mode planifié.
+- **Tâche Windows** (`ScheduledTasks.cs`).
+  - Format : XML Task Scheduler 1.2, enregistré par `schtasks /Create /TN "Checker San - <nom> (<id>)" /XML … /F`.
+  - Exécution : `InteractiveToken` et `LeastPrivilege`, donc avec le compte de l’utilisateur quand il est connecté, sans mot de passe enregistré ni droits administrateur.
+  - Réglages : `StartWhenAvailable` (une heure manquée est rattrapée), `IgnoreNew` (jamais deux vérifications à la fois), tâche lancée aussi sur batterie, limite de 72 h.
+  - Action : `CheckerSan.exe --scheduled <id>`, avec `--pairs <fichier>` si la liste des paires n’est pas celle par défaut.
+  - `Unregister` interroge la tâche avant de la supprimer. Les appels à schtasks passent par un délégué `Runner` remplaçable dans les tests.
+- **Mode planifié de l’app** (`App.xaml.cs`).
+  - `StartupUri` a été retiré : `OnStartup` ouvre la fenêtre principale lui-même, sauf avec `--scheduled`.
+  - Avec `--scheduled`, aucune fenêtre ne s’ouvre pendant la vérification, ni après si les dossiers sont identiques : l’app quitte avec le code 0.
+  - Sinon, `ScheduledResultWindow` s’ouvre sans prendre le focus (`ShowActivated = false`), avec « Ouvrir le rapport » et « Ouvrir dans Checker San ». La seconde remplit les dossiers et l’app quitte quand la fenêtre principale se ferme.
+  - Le code de sortie est celui de la ligne de commande : le Planificateur l’affiche comme dernier résultat.
+  - C’est l’app, et non la ligne de commande, qui est planifiée : c’est une application fenêtrée, donc aucune console n’apparaît.
+- **Fenêtre « Paires… »** (`PairsWindow.cs`, bouton dans l’en-tête) : enregistrer les dossiers actuels (un nom existant demande confirmation), ouvrir une paire, voir le dernier rapport, supprimer (la tâche est retirée d’abord ; dossiers et rapports intacts), planifier (fréquence, jour, heure) ou ne plus planifier. `MainWindow.LoadPair` remplit les deux dossiers et l’option.
+- **Simulation (22)** :
+  - en ligne de commande, `compare … --simulate-copy both|1to2|2to1` liste ce que « Compléter les dossiers » copierait, avec l’espace nécessaire et les conflits non remplacés ;
+  - en ligne de commande, `duplicates … --simulate-keep first|oldest|newest|shortest|folder [--keep-in d]` applique une règle de sélection et liste les copies qui seraient retirées et celles conservées ;
+  - les deux simulations figurent aussi dans le rapport `--json`, et rien n’est modifié ;
+  - nouvelles commandes `pairs` et `run <nom ou id>` (option `--pairs`) ;
+  - dans l’app, « Exporter la liste… » dans la fenêtre de copie (`CopyPlanWriter`) enregistre en CSV ce qui serait copié, hors des deux dossiers et sans remplacer de fichier. L’aperçu de retrait des doublons existait déjà, et l’export de la liste des doublons indique déjà le choix « À retirer ».
+- **Tests :**
+  - Moteur :
+    - « Saved pairs are unique, replaced in one step and never overwrite a damaged store » ;
+    - « A scheduled task runs as the user, read-only, and Windows accepts its definition ». Il valide le XML auprès de Windows avec `TASK_VALIDATE_ONLY` (API COM `Schedule.Service`), qui n’enregistre rien. Un XML invalide est bien refusé, vérifié à part ;
+    - « Saved pairs run from the command line with compact, rotated reports » ;
+    - « Copy and removal simulations list what would happen and change nothing ».
+  - WPF :
+    - « The pairs window saves, schedules and unschedules a pair through the scheduler », avec un faux schtasks ;
+    - « A scheduled result explains differences or failures without taking the focus » ;
+    - « The copy preview exports what would be copied, outside both folders ».
+  - Résultats : **134 tests moteur réussis trois fois de suite, 37 tests WPF réussis.**
+  - Le mode `--scheduled` de l’exécutable Release a aussi été lancé à la main sur deux dossiers identiques : sortie silencieuse avec le code 0 en une seconde, résultat enregistré, rapport écrit. Avec une liste de paires endommagée, il affiche bien la fenêtre « Vérification planifiée impossible ».
+- **Essai réel avec le Planificateur, fait le 23 octobre avec l’accord de l’utilisateur.** Tâche temporaire créée par `ScheduledTasks.Register`, sur deux dossiers d’essai du dossier temporaire de session, avec une version autonome publiée hors de `dist`.
+  - Windows a enregistré la tâche avec le SID de l’utilisateur, `InteractiveToken`, `IgnoreNew` et `StartWhenAvailable`. `RunLevel` et `ExecutionTimeLimit` n’apparaissent pas dans le XML exporté parce qu’ils valent les valeurs par défaut.
+  - Planifiée à 03:00 alors qu’il était 15:48, elle **ne s’est pas lancée d’elle-même** : prochaine exécution le lendemain à 03:00. Une heure déjà passée ne déclenche donc pas de vérification immédiate.
+  - `schtasks /Run` sur deux dossiers identiques : aucune fenêtre, dernier résultat 0, résultat et rapport enregistrés une seconde après le lancement.
+  - `schtasks /Run` après l’ajout d’un fichier : fenêtre de résultat ouverte dans la session sans prendre le focus (« 1 difference(s) », chemin du rapport, trois boutons), puis dernier résultat **1** après sa fermeture.
+  - Tâche supprimée par `ScheduledTasks.Unregister` (plus aucune tâche « Checker San » ensuite), dossiers d’essai supprimés. Les deux vérifications ont laissé une ligne chacune dans le journal d’activité de l’utilisateur.
+  - Attention : une version de développement dépendante du framework ne démarre pas depuis le Planificateur sur cette machine, car .NET 10 n’y est pas installé (seul le SDK local `.tools` l’est). Il faut planifier depuis la version autonome de `dist`.
+- **Non fait :**
+  - pas de vérification planifiée des instantanés ;
+  - pas de notification Windows (toast), seulement la fenêtre de résultat ;
+  - une tâche dont la paire a été supprimée hors de l’app affiche « la paire n’existe plus » : elle se supprime dans le Planificateur.
+
+## Lot vérification à distance — terminé le 23 octobre 2026 (non commité, au-dessus du lot vitesse)
+
+Demande : ligne de commande avec codes de sortie et rapport JSON (18), instantané exportable (19), journal d’activité (21).
+- **Instantané** (`FolderChecker.Core/Snapshot.cs`, `SnapshotEngine`).
+  - Contenu : chemins relatifs, tailles, date de modification et SHA-256 complet de chaque fichier, ainsi que les dossiers, y compris vides. Les liens et jonctions sont listés mais jamais suivis. Les fichiers en ligne uniquement ou illisibles vont dans `Unverified`.
+  - Lecture avec `DeviceReaders`. Un nouvel inventaire final signale tout changement survenu pendant la prise ; `Complete` vaut faux s’il manque la moindre preuve.
+  - `Compare(attendu, actuel)` donne `Missing`, `Changed`, `Added`, `MissingFolder` et `AddedFolder`. Un fichier non vérifié n’est pas compté comme absent, il rend seulement le résultat incertain.
+  - `Save` refuse d’écrire dans le dossier décrit, y compris via une jonction, ou par-dessus un fichier existant. `Load` refuse un instantané endommagé (schéma, empreintes, chemins). Format JSON, schéma 1.
+- **Ligne de commande** : nouveau projet `FolderChecker.Cli`, exécutable `checkersan-cli.exe`. Il ne s’appelle pas `checkersan.exe`, car Windows ignore la casse et `CheckerSan.exe` est dans le même dossier.
+  - Commandes : `compare <1> <2> [--json f] [--no-moved]`, `snapshot <dossier> <fichier>`, `verify <dossier> <fichier> [--json f]`, `duplicates <dossier> [--json f] [--min-size n] [--exclude "a;b"] [--include-hidden]`.
+  - Options communes : `--readers 1-16`, `--lang en|fr`, `--log fichier`.
+  - Codes de sortie : 0 rien à signaler, 1 écarts ou doublons prouvés, 2 vérification incomplète, 3 commande invalide ou erreur.
+  - Elle ne copie, ne déplace ni ne supprime jamais rien. Ctrl+C arrête proprement. La sortie console est en UTF-8, et la langue d’origine est rétablie après chaque appel (`CheckerSanCli.RunAsync` est utilisé directement par les tests).
+- **Journal d’activité** (`ActivityLog`) : `%LOCALAPPDATA%\CheckerSan\Logs\activity.log`, une ligne tabulée par comparaison, copie, recherche ou retrait de doublons, instantané, vérification et commande. Il fonctionne au mieux : une ligne impossible à écrire ne fait jamais échouer l’opération. Le journal strict des retraits reste `duplicate-actions.csv`.
+- **Interface** : bouton « Instantanés… » dans l’en-tête et fenêtre `SnapshotWindow` (créer, vérifier, arrêter, ouvrir le journal d’activité, liste des différences).
+- **Publication** : `build.ps1` publie aussi `checkersan-cli.exe` (autonome) et l’ajoute au ZIP ; non exécuté depuis.
+- **Tests** : « A snapshot detects every change, saves safely and rejects damage » et « Command-line exit codes report clean, different and incomplete results » (moteur) ; « The snapshot window opens from the header without reading anything » (WPF). **130 tests moteur réussis trois fois de suite, 34 tests WPF réussis.**
+- **Non fait :** pas de planification intégrée (le Planificateur de tâches Windows peut lancer `checkersan-cli`), pas de rapport CSV en ligne de commande (JSON seulement), aucun essai réel de la ligne de commande publiée en fichier unique.
+
+## Lot vitesse — terminé le 22 octobre 2026 (non commité, au-dessus du lot doublons)
+
+**Résultat final contre la référence d’avant le lot (NVMe, deux passages en alternance) :**
+
+| Mesure | Avant | Après |
+|---|---|---|
+| Comparaison de 2 × 2 000 fichiers de 64 Kio | 2,5–2,8 s | 0,63–0,65 s |
+| Comparaison de 2 × 1 Go | 3,0–3,3 s | 0,71–0,95 s |
+| Reprise de 10 000 fichiers | 2,8–2,9 s | 0,92–1,03 s |
+| Doublons, 2 000 fichiers de 64 Kio | 1,8–2,0 s | 0,94–0,99 s |
+| Doublons, 10 fichiers de 100 Mio | 0,81–0,90 s | 0,42–0,52 s |
+| Copie de 2 000 fichiers de 64 Kio | ≈ 28 s | ≈ 9,5 s |
+
+Sur le disque dur USB G:, aucune régression, et la copie de petits fichiers gagne 14 % (détails au point 5 ci-dessous). Nombre de lecteurs mesuré sur NVMe : 1 → 1,6 s, 2 → 0,9 s, 4 → 0,79 s, 8 → 0,77 s pour 2 × 1 Go ; 1,3–1,6 s, 1,0 s, 0,6–0,8 s, 0,5–0,6 s pour 2 × 2 000 petits fichiers. `SolidStateReads = 4` est conservé. La recherche de doublons lit maintenant en deux phases parallèles (`ReadAllAsync` : échantillons, puis empreintes complètes), avec `DuplicateScanOptions.ParallelReads`, son état partagé protégé par `_gate` et `_saving`. Le test « One reader or four give identical comparisons and duplicate groups » vérifie lignes, empreintes, octets lus et groupes. **128 tests moteur réussis six fois de suite, 33 tests WPF réussis.** Il n’y a aucune option d’interface pour le nombre de lecteurs, et les partages réseau, non mesurés, restent à un lecteur.
+
+Lot demandé : lecture parallèle adaptée au disque (13), copie plus rapide (14), inventaire plus efficace (16), chaque gain **mesuré avant activation par défaut**. L’état des lots précédents est conservé sans commit dans deux arbres Git : lot fiabilité `d5c8620efa6531ec2fc41e6599dc10dca8c47149`, lot doublons `bde4878b195a44805f7f52f15d6f7ee786be1ea0`. Pour faire trois commits séparés : `git commit-tree <arbre> -p <parent> -m …`, puis un commit final de l’état courant, et `git update-ref`/push uniquement après accord de l’utilisateur, qui veut d’abord tester.
+
+Machine de mesure : SSD NVMe C: (Micron 2450, seulement 19 Go libres), disque dur USB G: personnel (ne pas écrire dessus sans accord), Ryzen 9 6900HX 8 cœurs, Defender actif. Banc d’essai : application console qui écrit des données de test sans cache (lectures froides) puis mesure comparaison, doublons, copie et reprise. Elle était dans le dossier temporaire de session et est à recréer si besoin.
+
+**Fait et mesuré (NVMe, références avant/après en alternance) :**
+- **Lectures synchrones** dans la comparaison (`ReadHash`, `ReadSample`) et la copie. Avec `FileStream` asynchrone, lecture + SHA-256 tombait à environ 600 Mio/s, contre 1,2–1,36 Gio/s en synchrone (la lecture anticipée du cache chevauche le hachage). Comparaison de 2 × 1 Go : 3,2 s → 1,6 s ; 2 × 2 000 fichiers de 64 Kio : 2,55 s → 1,31 s. Le plafond atteint est celui du SHA-256 sur un cœur (≈ 1,35 Gio/s).
+- **Moins d’appels système** : `FileSafety.Stat` (un seul `GetFileAttributesExW` au lieu de trois appels .NET) et `FileSafety.Describe` (dates et identité du fichier ouvert en deux requêtes au lieu de quatre). Tampon d’énumération de 64 Kio pour les partages. Reprise de 10 000 fichiers : 2,65 s → 1,42 s ; doublons de 2 000 fichiers : 1,82 s → 1,47 s.
+- **Copie par un seul handle non mis en cache** (`OpenPartial`) : écriture alignée sur la taille de secteur réelle (`FileStorageInfo`, 4 Kio par défaut), `FlushToDisk`, relecture SHA-256 par le même handle, puis renommage par ce même handle (`FileSafety.RenameByHandle` + `OpenDirectory`, jamais d’écrasement). Partage en lecture seule : personne ne peut écrire, renommer ni supprimer le temporaire. Cause mesurée : rouvrir un fichier tout juste écrit coûtait ≈ 9 ms (analyse Defender), sur 14 ms par fichier de 64 Kio. 2 000 fichiers de 64 Kio : ≈ 28 s → ≈ 9,5 s (médianes de quatre passages).
+- Une reprise de temporaire non aligné (ancienne version) repart de l’offset aligné inférieur, après vérification du préfixe.
+- Les écritures non mises en cache se chevauchent avec la lecture du bloc suivant (deux tampons alignés). Ce point n’a pas pu être mesuré : les gros transferts sur ce SSD presque plein varient de 2,3 à 17 s.
+- **Écarté après mesure :** `FILE_FLAG_WRITE_THROUGH` à la place de `Flush(true)` (1 Go en 8–10,7 s au lieu de 3–3,9 s, aucun gain sur les petits fichiers). Clonage ReFS/Dev Drive : aucun volume ReFS pour le tester.
+- `FileSafety.Storage` identifie le disque (numéro via `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`, SSD via la pénalité de recherche). Un bus USB ou inconnu donne `Unknown`, c’est-à-dire une lecture à la fois. Les chemins UNC et lecteurs réseau donnent `Network`, une à la fois par défaut. Vérifié : C: → `disk:0 SolidState`, G: → `disk:1 Unknown`, `\\server\share` → `Network`.
+- `DeviceReaders` (nouveau fichier) : un sémaphore par disque physique, 4 lecteurs sur SSD interne et 1 ailleurs (`ComparisonOptions.ParallelReads` permet de forcer la valeur, aucune interface pour l’instant). Deux dossiers sur deux disques différents sont lus en même temps ; deux dossiers sur le même disque dur, un fichier à la fois.
+- Comparaison : `PrefetchPairsAsync` calcule à l’avance, en parallèle, les échantillons et empreintes des paires de même chemin. La boucle de verdict séquentielle trouve ensuite tout en cache : ses décisions ne changent pas. État partagé protégé par `_gate` (caches, compteurs, `MarkUnverified`, progression), compteurs d’octets via `Interlocked`, sauvegarde du journal de reprise avec le drapeau `_saving`. Sans gain possible (`Slots` = 1), le préchargement est ignoré et le comportement est identique à avant.
+- Test de reprise après annulation adapté au parallélisme : un fichier inachevé est relu à la reprise ; seul un fichier terminé, dont l’empreinte est recontrôlée dans le journal, ne l’est jamais. 127 tests moteur réussis huit fois de suite.
+
+**Étapes (toutes faites sauf la 6) :**
+1. Nombre de lecteurs mesuré ; 4 conservé.
+2. Doublons en parallèle.
+3. Test 1 lecteur contre 4.
+4. Deux suites relancées ; mesures finales dans le tableau ci-dessus.
+5. ~~Validation sur disque dur~~ **faite le 22 octobre avec l’accord de l’utilisateur.** Le dossier `G:\CheckerSan-perf-test` a été vidé par chaque mesure, mais la suppression du dossier vide a été bloquée par un contrôle de sécurité de l’outil : l’utilisateur doit le supprimer lui-même. G: est le disque USB Seagate, traité comme `Unknown`, donc un lecteur. Référence (avant le lot) contre version actuelle :
+   - copie de 1 Go de G: vers G: : 50,3/51,6 s contre 50,1/52,1 s, aucune régression des écritures non mises en cache ;
+   - comparaison de 2 × 1 Go sur G: : 28,7/29,3 s contre 29,5/29,1 s, identique car le disque est lu un fichier à la fois ;
+   - comparaison entre deux disques (dossier 1 sur le SSD, dossier 2 sur G:) : 14,9/17,0 s contre 15,5/15,3 s. Gain faible, car c’est le disque dur qui limite ;
+   - copie de 2 000 fichiers de 64 Kio sur G: : 138,8 s contre 120,0 s (−14 %).
+   Il n’existe toujours aucune mesure en réseau : les partages restent à un lecteur.
+6. Plus tard, si l’utilisateur le demande : une option d’interface « lectures simultanées » pour essayer 2 à 4 lecteurs sur un partage réseau, puis la documenter dans l’aide.
 
 ## Validation du lot doublons (filtres, règles, Corbeille, restauration, journal, export) — 22 octobre 2026
 

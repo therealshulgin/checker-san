@@ -21,9 +21,10 @@ public static class DuplicateSelection
         var undecided = 0;
         foreach (var group in scan.Groups)
         {
-            var candidates = rule == KeepRule.InFolder
-                ? group.Files.Where(file => FileSafety.IsWithin(folder!, file.FullPath)).ToArray()
-                : group.Files.ToArray();
+            // A copy in a quarantine is never the one kept: it is the copy set aside.
+            var candidates = (rule == KeepRule.InFolder
+                ? group.Files.Where(file => FileSafety.IsWithin(folder!, file.FullPath))
+                : group.Files).Where(file => !DuplicateRemoval.IsInQuarantine(file.RelativePath)).ToArray();
             if (candidates.Length == 0) { undecided++; continue; }
             var byPath = candidates.OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase);
             var keeper = (rule switch

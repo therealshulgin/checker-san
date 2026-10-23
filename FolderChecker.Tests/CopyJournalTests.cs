@@ -43,7 +43,8 @@ internal static partial class Program
         if (!OperatingSystem.IsWindows()) throw new SkipTestException("Windows I/O counters");
         using var w = new TestWorkspace();
         const int count = 400;
-        for (var i = 0; i < count; i++) w.FileAt(w.Source, $"photos/{i:D4}.jpg", BitConverter.GetBytes(i));
+        // One sector each, so uncached copies write exactly their data and the rest is journal.
+        for (var i = 0; i < count; i++) w.FileAt(w.Source, $"photos/{i:D4}.jpg", TestWorkspace.Bytes(4096, i));
         var plan = CopyEngine.CreatePlan(await Compare(w), true);
         var journal = Path.Combine(w.Root, "copy.json");
         var before = BytesWrittenByProcess();

@@ -6,6 +6,8 @@
         <StackPanel><StackPanel Orientation="Horizontal"><Viewbox Width="27" Height="27" Margin="0,2,12,0"><Path Data="M2,7 L2,3 10,3 13,6 25,6 25,23 2,23 Z M2,9 L25,9" Stroke="#D0D0D0" StrokeThickness="1.7" StrokeLineJoin="Round"/></Viewbox><TextBlock Text="Checker San" FontSize="26" FontWeight="SemiBold" Foreground="White"/></StackPanel></StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <ComboBox x:Name="LanguageBox" Width="125" MinHeight="37" Margin="0,0,12,0" SelectedValuePath="Tag" SelectionChanged="Language_Changed" AutomationProperties.Name="{DynamicResource Main_Language}" ToolTip="{DynamicResource Main_Language}"><ComboBoxItem Content="English" Tag="en"/><ComboBoxItem Content="Français" Tag="fr"/></ComboBox>
+          <Button x:Name="PairsButton" Content="{DynamicResource Main_Pairs}" Click="Pairs_Click" VerticalAlignment="Center" Margin="0,0,8,0"/>
+          <Button x:Name="SnapshotsButton" Content="{DynamicResource Main_Snapshots}" Click="Snapshots_Click" VerticalAlignment="Center" Margin="0,0,8,0"/>
           <Button x:Name="DuplicatesButton" Content="{DynamicResource Main_DuplicateMode}" Click="Duplicates_Click" VerticalAlignment="Center"/>
         </StackPanel>
       </Grid>

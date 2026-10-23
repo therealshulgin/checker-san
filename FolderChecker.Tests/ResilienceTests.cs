@@ -23,11 +23,9 @@ internal static partial class Program
         AddCheckpointFiles(w);
         var checkpoint = Path.Combine(w.Root, "partial-checkpoint.json");
         using var cancellation = new CancellationTokenSource();
-        string? completedPath = null;
         var progress = new InlineProgress(p =>
         {
             if (p.FilesHashed == 0 || cancellation.IsCancellationRequested) return;
-            completedPath = p.CurrentPath;
             cancellation.Cancel();
         });
         var partial = await new ComparisonEngine().CompareAsync(w.Source, w.Target,
@@ -36,17 +34,23 @@ internal static partial class Program
         Check(partial.FilesVerified > 0 && partial.FilesVerified < 6, "cancellation follows at least one completed hash");
         Check(partial.CheckpointSaved && partial.HasCheckpoint, "completed partial hashes are saved on cancellation");
         Check(File.Exists(checkpoint), "partial checkpoint is persisted to disk");
-        Check(!string.IsNullOrWhiteSpace(completedPath), "completed file path was reported");
-        var savedHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(completedPath!)));
-        Check(File.ReadAllText(checkpoint).Contains(savedHash, StringComparison.OrdinalIgnoreCase),
-            "checkpoint contains the independently verified completed digest");
+        // Several files may be read at once: every saved digest must match an independent hash of its file.
+        var saved = System.Text.Json.JsonDocument.Parse(File.ReadAllText(checkpoint)).RootElement.GetProperty("Files").EnumerateArray()
+            .Select(file => (Path: file.GetProperty("FullPath").GetString()!, Hash: file.GetProperty("Hash").GetString()!, Size: file.GetProperty("Size").GetInt64()))
+            .ToArray();
+        Equal(partial.FilesVerified, (long)saved.Length, "every completed hash is saved");
+        Check(saved.All(file => string.Equals(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(file.Path))), file.Hash, StringComparison.OrdinalIgnoreCase)),
+            "checkpoint contains independently verified completed digests");
+
+        // Files still being read when the stop arrived start over on resume.
+        var completedBytes = saved.Sum(file => file.Size);
 
         // A distinct engine instance must load persisted state, not retain in-memory hashes.
         var resumed = await new ComparisonEngine().CompareAsync(w.Source, w.Target, CheckpointOptions(checkpoint));
         AssertVerifiedIdentical(resumed);
         Equal(partial.FilesVerified, resumed.FilesReused, "only previously completed files are reused");
         var totalBytes = 2L * Enumerable.Range(0, 3).Sum(index => 256 * 1024 + 17 + index);
-        Equal(totalBytes, partial.BytesRead + resumed.BytesRead, "completed file content is not reread after resume");
+        Equal(totalBytes - completedBytes, resumed.BytesRead, "completed file content is not reread after resume");
         Check(resumed.CheckpointSaved, "resumed work updates its persistent checkpoint");
     }
 
@@ -55,7 +59,8 @@ internal static partial class Program
         using var w = new TestWorkspace();
         AddCheckpointFiles(w);
         var checkpoint = Path.Combine(w.Root, "checkpoint.json");
-        AssertVerifiedIdentical(await Compare(w, CheckpointOptions(checkpoint, false)));
+        var first = await Compare(w, CheckpointOptions(checkpoint, false));
+        AssertVerifiedIdentical(first);
         var modifiedPath = Path.Combine(w.Source, "file-1.bin");
         var originalWriteTime = File.GetLastWriteTimeUtc(modifiedPath);
         var bytes = File.ReadAllBytes(modifiedPath);
@@ -64,7 +69,7 @@ internal static partial class Program
         File.SetLastWriteTimeUtc(modifiedPath, originalWriteTime.AddSeconds(5));
 
         var result = await Compare(w, CheckpointOptions(checkpoint));
-        AssertOnlyChangedFileRehashed(w, result, bytes.Length);
+        AssertOnlyChangedFileRehashed(w, result, bytes.Length, first);
     }
 
     private static async Task CheckpointDetectsRestoredTimestamps()
@@ -73,7 +78,8 @@ internal static partial class Program
         using var w = new TestWorkspace();
         AddCheckpointFiles(w);
         var checkpoint = Path.Combine(w.Root, "checkpoint.json");
-        AssertVerifiedIdentical(await Compare(w, CheckpointOptions(checkpoint, false)));
+        var first = await Compare(w, CheckpointOptions(checkpoint, false));
+        AssertVerifiedIdentical(first);
         var modifiedPath = Path.Combine(w.Source, "file-1.bin");
         var originalWriteTime = File.GetLastWriteTimeUtc(modifiedPath);
         var originalCreationTime = File.GetCreationTimeUtc(modifiedPath);
@@ -86,14 +92,15 @@ internal static partial class Program
         Equal(originalCreationTime, File.GetCreationTimeUtc(modifiedPath), "creation timestamp was restored");
 
         var result = await Compare(w, CheckpointOptions(checkpoint));
-        AssertOnlyChangedFileRehashed(w, result, bytes.Length);
+        AssertOnlyChangedFileRehashed(w, result, bytes.Length, first);
     }
 
-    private static void AssertOnlyChangedFileRehashed(TestWorkspace w, ComparisonResult result, long length)
+    private static void AssertOnlyChangedFileRehashed(TestWorkspace w, ComparisonResult result, long length, ComparisonResult first)
     {
         NoStrictVerdicts(result);
         Check(!result.ContentCovered, "changed source bytes are not covered by stale cached hashes");
-        Equal(5L, result.FilesReused, "five unchanged files reuse their completed digests");
+        // The warnings tell a resume file that could not be saved (antivirus) from a reuse that was refused.
+        Equal(5L, result.FilesReused, "five unchanged files reuse their completed digests; warnings: " + string.Join(" / ", first.Warnings.Concat(result.Warnings)));
         Equal(length, result.BytesRead, "only the changed same-size file is read again");
         Equal(ComparisonStatus.Different, SourceRow(result, w.Source, "file-1.bin").Status,
             "changed content is reported as different");

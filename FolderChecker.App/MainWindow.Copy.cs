@@ -12,6 +12,15 @@ public partial class MainWindow
     private CopyPlan? _savedCopy;
     internal static void ApplyDarkTitleBar(Window window)
     { int dark = 1; DwmSetWindowAttribute(new WindowInteropHelper(window).Handle, 20, ref dark, sizeof(int)); }
+    private bool ShowsFolders(string first, string second)
+    {
+        static bool Same(string box, string root)
+        {
+            try { return string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(box.Trim().Trim('"'))), Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)), StringComparison.OrdinalIgnoreCase); }
+            catch (ArgumentException) { return false; }
+        }
+        return Same(SourceBox.Text, first) && Same(TargetBox.Text, second);
+    }
     private void RefreshCopy()
     {
         _savedCopy = CopyEngine.ReadPlan(_copyCheckpointPath);
@@ -29,7 +38,10 @@ public partial class MainWindow
         _result = null; _rows = []; _view = null; ResultsGrid.ItemsSource = null;
         ExportButton.IsEnabled = false;
         IdenticalCount.Text = MissingCount.Text = DifferentCount.Text = MovedCount.Text = ExtraCount.Text = "—";
-        SourceBox.Text = plan.SourceRoot; TargetBox.Text = plan.TargetRoot;
+        // Folder 1 and folder 2 keep their place: a copy from 2 to 1 must not swap them, which would turn the
+        // next verdicts around. Only a resumed copy of other folders fills them in.
+        if (!ShowsFolders(plan.SourceRoot, plan.TargetRoot) && !ShowsFolders(plan.TargetRoot, plan.SourceRoot))
+        { SourceBox.Text = plan.SourceRoot; TargetBox.Text = plan.TargetRoot; }
         _cancellation = new CancellationTokenSource(); SetBusy(true);
         TransferButton.IsEnabled = false;
         VerdictTitle.Text = plan.Bidirectional ? L.T("Complétion des deux dossiers", "Completing both folders") : L.T("Copie des éléments manquants", "Copying missing items");
@@ -50,6 +62,7 @@ public partial class MainWindow
         try
         {
             var copy = await new CopyEngine().CopyAsync(plan, _copyCheckpointPath, progress, _cancellation.Token);
+            ActivityLog.Write(L.T("Copie", "Copy"), $"{plan.SourceRoot} → {plan.TargetRoot} · {copy.CompletedFiles}/{copy.TotalFiles} file(s) · complete={copy.Complete} · {copy.Errors.Count} error(s)");
             SetStatus(() =>
             {
                 VerdictTitle.Text = copy.Complete ? L.T("Copie terminée et vérifiée", "Copy complete and verified") : copy.Cancelled ? L.T("Copie interrompue — reprise disponible", "Copy stopped — resume available") : L.T("Copie incomplète — des éléments restent à traiter", "Copy incomplete — some items still need processing");

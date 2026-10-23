@@ -108,6 +108,7 @@ public partial class DuplicatesWindow : Window
                 SkipHiddenAndSystem = HiddenCheck.IsChecked == true
             }, progress, active.Token);
             ApplyResult(result);
+            ActivityLog.Write(L.T("Doublons", "Duplicates"), $"{result.Root} · {result.Groups.Count} group(s) · verified={result.SnapshotVerified} · {result.Errors.Count} error(s)");
         }
         catch (Exception ex) { StatusText.Text = L.T("Analyse impossible", "Unable to scan"); ShowIssues([ex.Message]); }
         finally { FinishOperation(); }
@@ -232,6 +233,7 @@ public partial class DuplicatesWindow : Window
         try
         {
             var result = await new DuplicateRemoval { LogPath = _logPath }.DeleteAsync(scan, paths, mode, progress, active.Token);
+            ActivityLog.Write(L.T("Retrait de doublons", "Duplicate removal"), $"{scan.Root} · {mode} · {result.DeletedPaths.Count} file(s) · complete={result.Complete} · details in {_logPath}");
             ClearResult();
             StatusText.Text = result.Complete ? L.T("Opération terminée — relancez l’analyse", "Operation finished — run the scan again") : L.T("Opération interrompue — relancez l’analyse", "Operation interrupted — run the scan again");
             StatsText.Text = mode switch

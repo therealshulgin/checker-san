@@ -8,5 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\FolderChecker.Core\FolderChecker.Core.csproj" />
+    <ProjectReference Include="..\FolderChecker.Cli\FolderChecker.Cli.csproj" />
   </ItemGroup>
 </Project>

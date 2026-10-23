@@ -105,6 +105,10 @@ public sealed class DuplicateEngine
         private string _root = "", _canonicalRoot = "", _phase = L.T("Préparation", "Preparing"), _currentPath = "";
         private string? _checkpoint;
         private long _bytesRead, _filesScanned, _filesFiltered;
+        // Guards the caches, sets, warnings and checkpoint while several files are read at once.
+        private readonly object _gate = new();
+        private bool _saving;
+        private DeviceReaders? _readers;
         private int _retryAttempt;
         private bool _checkpointDirty;
 
@@ -127,52 +131,67 @@ public sealed class DuplicateEngine
                     return true;
                 }, _root);
                 PrepareCheckpoint();
+                _readers = new DeviceReaders([_root], options.ParallelReads);
                 SetPhase(L.T("Inventaire des fichiers", "Listing files"));
                 var initial = await InventoryAsync(true);
                 var onlineOnly = initial.Values.Count(item => item.Access == EntryAccess.OnlineOnly);
                 if (onlineOnly > 0)
                     _warnings.Add(L.F($"{onlineOnly:N0} fichier(s) disponible(s) uniquement en ligne n’ont pas été analysés, pour ne pas les télécharger.", $"{onlineOnly:N0} online-only file(s) were not scanned, to avoid downloading them."));
                 _filesFiltered += initial.Values.Count(item => !item.Directory && item.Access == EntryAccess.Normal && item.File.Size < options.MinimumSize);
-                foreach (var sizeGroup in initial.Values.Where(item => !item.Directory && item.Access == EntryAccess.Normal && item.File.Size >= options.MinimumSize)
-                             .GroupBy(item => item.File.Size).Where(group => group.Count() > 1))
+                // Two phases, each read as many files at once as the device allows: samples of every
+                // same-size candidate, then complete hashes of every file whose sample matches another.
+                // Groups are then formed in the same order and with the same rules as before.
+                var sizeGroups = initial.Values.Where(item => !item.Directory && item.Access == EntryAccess.Normal && item.File.Size >= options.MinimumSize)
+                    .GroupBy(item => item.File.Size).Where(group => group.Count() > 1)
+                    .Select(group => group.OrderBy(item => item.File.RelativePath, StringComparer.OrdinalIgnoreCase).Select(item => item.File).ToArray())
+                    .ToArray();
+                SetPhase(L.T("Filtrage rapide des candidats", "Quick candidate filtering"));
+                var samples = await ReadAllAsync(sizeGroups.SelectMany(group => group).ToArray(), false);
+                var next = 0;
+                var sampleGroups = new List<(long Size, CacheEntry[] Files)>();
+                foreach (var sizeGroup in sizeGroups)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    SetPhase(L.T("Filtrage rapide des candidats", "Quick candidate filtering"));
                     var candidates = new List<CacheEntry>();
                     var physicalFiles = new HashSet<string>(StringComparer.Ordinal);
-                    foreach (var item in sizeGroup.OrderBy(item => item.File.RelativePath, StringComparer.OrdinalIgnoreCase))
+                    foreach (var file in sizeGroup)
                     {
-                        var sample = await ReadSafeAsync(item.File, false);
+                        var sample = samples[next++];
                         if (sample is null) continue;
                         var physical = PhysicalIdentity(sample.File.Identity);
                         if (physical is not null && !physicalFiles.Add(physical))
                         {
-                            _warnings.Add(L.F($"Lien physique écarté du calcul d’espace récupérable : {item.File.RelativePath}", $"Hard-linked file excluded from recoverable space: {item.File.RelativePath}"));
+                            lock (_gate) _warnings.Add(L.F($"Lien physique écarté du calcul d’espace récupérable : {file.RelativePath}", $"Hard-linked file excluded from recoverable space: {file.RelativePath}"));
                             continue;
                         }
                         candidates.Add(sample);
                     }
-                    foreach (var sampleGroup in candidates.GroupBy(item => item.Sample).Where(group => group.Count() > 1))
+                    sampleGroups.AddRange(candidates.GroupBy(item => item.Sample).Where(group => group.Count() > 1).Select(group => (sizeGroup[0].Size, group.ToArray())));
+                }
+                SetPhase(L.T("Vérification SHA-256 complète", "Complete SHA-256 verification"));
+                var pending = sampleGroups.SelectMany(group => group.Files).Where(entry => entry.Hash is null).Select(entry => entry.File).ToArray();
+                var complete = (await ReadAllAsync(pending, true)).Zip(pending)
+                    .Where(pair => pair.First is not null).ToDictionary(pair => pair.Second.FullPath, pair => pair.First!, StringComparer.OrdinalIgnoreCase);
+                foreach (var (size, files) in sampleGroups)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var hashed = new List<CacheEntry>();
+                    foreach (var candidate in files)
                     {
-                        SetPhase(L.T("Vérification SHA-256 complète", "Complete SHA-256 verification"));
-                        var hashed = new List<CacheEntry>();
-                        foreach (var candidate in sampleGroup)
+                        var entry = candidate.Hash is not null ? candidate : complete.GetValueOrDefault(candidate.File.FullPath);
+                        if (entry?.Hash is not null)
                         {
-                            var complete = candidate.Hash is not null ? candidate : await ReadSafeAsync(candidate.File, true);
-                            if (complete?.Hash is not null)
-                            {
-                                _fullyHashed.Add(complete.File.FullPath);
-                                hashed.Add(complete);
-                            }
+                            lock (_gate) _fullyHashed.Add(entry.File.FullPath);
+                            hashed.Add(entry);
                         }
-                        foreach (var hashGroup in hashed.GroupBy(item => item.Hash!).Where(group => group.Count() > 1))
+                    }
+                    foreach (var hashGroup in hashed.GroupBy(item => item.Hash!).Where(group => group.Count() > 1))
+                    {
+                        _groups.Add(new DuplicateGroup
                         {
-                            _groups.Add(new DuplicateGroup
-                            {
-                                Hash = hashGroup.Key, Size = sizeGroup.Key,
-                                Files = hashGroup.Select(item => item.File).OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray()
-                            });
-                        }
+                            Hash = hashGroup.Key, Size = size,
+                            Files = hashGroup.Select(item => item.File).OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray()
+                        });
                     }
                 }
                 cancellationToken.ThrowIfCancellationRequested();
@@ -249,7 +268,12 @@ public sealed class DuplicateEngine
                         if (!string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase)
                             && FileSafety.Access(directory, directoryAttributes) == EntryAccess.Link)
                             throw new IOException(L.F($"Le dossier est devenu un lien : {directory}", $"The folder has been replaced by a link: {directory}"));
-                        foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
+                        // A larger listing buffer means fewer round trips per folder on network shares.
+                        foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos("*", new EnumerationOptions
+                                 {
+                                     RecurseSubdirectories = false, IgnoreInaccessible = false, AttributesToSkip = 0,
+                                     ReturnSpecialDirectories = false, MatchType = MatchType.Win32, BufferSize = 64 * 1024
+                                 }))
                         {
                             cancellationToken.ThrowIfCancellationRequested();
                             // Enumeration already supplies these metadata. Re-querying every path
@@ -267,12 +291,14 @@ public sealed class DuplicateEngine
                                 if ((attributes & FileAttributes.Directory) == 0)
                                     throw new IOException(L.F($"Le dossier a changé de type : {entry.FullName}", $"The folder has changed type: {entry.FullName}"));
                             }
-                            if (string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase)
-                                && isDirectory && string.Equals(entry.Name, DuplicateRemoval.QuarantineDirectoryName,
-                                    StringComparison.OrdinalIgnoreCase)
+                            // At any depth: a quarantine made while scanning a subfolder must never pass for a
+                            // live copy, nor become the copy that is kept, when a parent folder is scanned later.
+                            if (isDirectory && string.Equals(entry.Name, DuplicateRemoval.QuarantineDirectoryName, StringComparison.OrdinalIgnoreCase)
                                 && DuplicateRemoval.IsManagedQuarantine(entry.FullName))
                             {
-                                _warnings.Add(L.T("La quarantaine Checker San est exclue de la recherche de doublons.", "The Checker San quarantine is excluded from the duplicate search."));
+                                _warnings.Add(string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase)
+                                    ? L.T("La quarantaine Checker San est exclue de la recherche de doublons.", "The Checker San quarantine is excluded from the duplicate search.")
+                                    : L.F($"Quarantaine Checker San exclue de la recherche : {Path.GetRelativePath(_root, entry.FullName)}", $"Checker San quarantine excluded from the search: {Path.GetRelativePath(_root, entry.FullName)}"));
                                 continue;
                             }
                             var file = new DuplicateFile
@@ -327,9 +353,23 @@ public sealed class DuplicateEngine
             }
             catch (Exception exception) when (IsFileError(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
-                _errors.Add(L.F($"Lecture impossible ({file.RelativePath}) : {exception.Message}", $"Unable to read ({file.RelativePath}): {exception.Message}"));
+                lock (_gate) _errors.Add(L.F($"Lecture impossible ({file.RelativePath}) : {exception.Message}", $"Unable to read ({file.RelativePath}): {exception.Message}"));
                 return null;
             }
+        }
+
+        /// <summary>Reads files as many at once as their device allows; results keep the input order.</summary>
+        private async Task<CacheEntry?[]> ReadAllAsync(IReadOnlyList<DuplicateFile> files, bool full)
+        {
+            var results = new CacheEntry?[files.Count];
+            if (_readers is not { Slots: > 1 } readers)
+            {
+                for (var i = 0; i < files.Count; i++) results[i] = await ReadSafeAsync(files[i], full);
+                return results;
+            }
+            await Parallel.ForEachAsync(Enumerable.Range(0, files.Count), new ParallelOptions { MaxDegreeOfParallelism = readers.Slots, CancellationToken = cancellationToken },
+                async (i, token) => results[i] = await readers.Run(files[i].FullPath, () => ReadSafeAsync(files[i], full), token));
+            return results;
         }
 
         private CacheEntry? Read(DuplicateFile expected, bool full)
@@ -345,22 +385,25 @@ public sealed class DuplicateEngine
             var linkCount = HardLinkCount(stream.SafeFileHandle);
             if (linkCount > 1)
             {
-                _warnings.Add(L.F($"Lien physique écarté du calcul d’espace récupérable : {expected.RelativePath}", $"Hard-linked file excluded from recoverable space: {expected.RelativePath}"));
+                lock (_gate) _warnings.Add(L.F($"Lien physique écarté du calcul d’espace récupérable : {expected.RelativePath}", $"Hard-linked file excluded from recoverable space: {expected.RelativePath}"));
                 return null;
             }
             if (linkCount is null)
-                _warnings.Add(L.T("Le système ne fournit pas le nombre de liens physiques de certains fichiers : leur suppression automatique sera refusée.", "The system does not report the hard-link count for some files; automatic removal of those files will be refused."));
+                lock (_gate) _warnings.Add(L.T("Le système ne fournit pas le nombre de liens physiques de certains fichiers : leur suppression automatique sera refusée.", "The system does not report the hard-link count for some files; automatic removal of those files will be refused."));
             CacheEntry? prior = null;
-            if (_completed.TryGetValue(current.FullPath, out var inRun)) prior = inRun;
-            else if (_cached.TryGetValue(current.FullPath, out var persisted)) prior = persisted;
-            if (current.Identity is not null && prior is not null && SameMetadata(prior.File, current)
-                && prior.File.Identity == current.Identity && (!full || prior.Hash is not null))
+            lock (_gate)
             {
-                if (!_completed.ContainsKey(current.FullPath)) _reused.Add(current.FullPath);
-                _completed[current.FullPath] = prior;
-                if (prior.Hash is not null) _fullyHashed.Add(current.FullPath);
-                Report();
-                return prior;
+                if (_completed.TryGetValue(current.FullPath, out var inRun)) prior = inRun;
+                else if (_cached.TryGetValue(current.FullPath, out var persisted)) prior = persisted;
+                if (current.Identity is not null && prior is not null && SameMetadata(prior.File, current)
+                    && prior.File.Identity == current.Identity && (!full || prior.Hash is not null))
+                {
+                    if (!_completed.ContainsKey(current.FullPath)) _reused.Add(current.FullPath);
+                    _completed[current.FullPath] = prior;
+                    if (prior.Hash is not null) _fullyHashed.Add(current.FullPath);
+                    Report();
+                    return prior;
+                }
             }
             var small = stream.Length <= SampleLength * 3L;
             var digest = full || small ? ReadWhole(stream) : ReadSample(stream);
@@ -375,9 +418,12 @@ public sealed class DuplicateEngine
             };
             // Full hashing follows a successful sample for every large candidate.
             if (entry.Sample.Length != 64) throw new IOException(L.T("Échantillon du fichier indisponible.", "The file sample is unavailable."));
-            _completed[current.FullPath] = entry;
-            if (entry.Hash is not null) _fullyHashed.Add(current.FullPath);
-            _checkpointDirty = true;
+            lock (_gate)
+            {
+                _completed[current.FullPath] = entry;
+                if (entry.Hash is not null) _fullyHashed.Add(current.FullPath);
+                _checkpointDirty = true;
+            }
             SaveCheckpoint(false);
             Report();
             return entry;
@@ -394,7 +440,7 @@ public sealed class DuplicateEngine
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     hash.AppendData(buffer, 0, read);
-                    _bytesRead += read;
+                    Interlocked.Add(ref _bytesRead, read);
                     Report();
                 }
                 cancellationToken.ThrowIfCancellationRequested();
@@ -419,7 +465,7 @@ public sealed class DuplicateEngine
                     {
                         var read = stream.Read(buffer, count, SampleLength - count);
                         if (read == 0) throw new IOException(L.T("Fin de fichier inattendue pendant l’échantillonnage.", "Unexpected end of file while sampling."));
-                        _bytesRead += read;
+                        Interlocked.Add(ref _bytesRead, read);
                         count += read;
                     }
                     hash.AppendData(buffer, 0, count);
@@ -466,14 +512,13 @@ public sealed class DuplicateEngine
 
         private static DuplicateFile Describe(DuplicateFile original, string? identity)
         {
-            var info = new FileInfo(original.FullPath);
-            var attributes = File.GetAttributes(original.FullPath);
-            if ((attributes & FileAttributes.Directory) != 0 || FileSafety.Access(original.FullPath, attributes) != EntryAccess.Normal)
+            var metadata = FileSafety.Stat(original.FullPath);
+            if ((metadata.Attributes & FileAttributes.Directory) != 0 || FileSafety.Access(original.FullPath, metadata.Attributes) != EntryAccess.Normal)
                 throw new IOException(L.T("Le chemin ne désigne plus un fichier ordinaire.", "The path no longer refers to a regular file."));
             return original with
             {
-                Size = info.Length, LastWriteUtc = info.LastWriteTimeUtc, CreationUtc = info.CreationTimeUtc,
-                Attributes = attributes, Identity = identity
+                Size = metadata.Size, LastWriteUtc = metadata.LastWriteUtc, CreationUtc = metadata.CreationUtc,
+                Attributes = metadata.Attributes, Identity = identity
             };
         }
 
@@ -488,6 +533,11 @@ public sealed class DuplicateEngine
                 ValidateCheckpoint(checkpoint);
                 _checkpoint = checkpoint;
                 if (!options.ResumeFromCheckpoint || !File.Exists(checkpoint)) return;
+                if (!FileSafety.KeepsChangeTime(_root))
+                {
+                    _warnings.Add(L.T("Ce disque ne tient pas de date de changement fiable (FAT32, exFAT…) : les vérifications précédentes ne sont pas réutilisées, tout est relu.", "This drive keeps no reliable change time (FAT32, exFAT…): earlier checks are not reused, everything is read again."));
+                    return;
+                }
                 using var stream = new FileStream(checkpoint, FileMode.Open, FileAccess.Read, FileShare.Read);
                 if (stream.Length > 128L * 1024 * 1024) throw new JsonException(L.T("Session trop volumineuse.", "The session file is too large."));
                 var cache = JsonSerializer.Deserialize<Cache>(stream);
@@ -530,7 +580,15 @@ public sealed class DuplicateEngine
         private bool SaveCheckpoint(bool force)
         {
             if (_checkpoint is null) return false;
-            if (!force && (!_checkpointDirty || _saveTimer.ElapsedMilliseconds < 1000)) return false;
+            List<CacheEntry> files;
+            lock (_gate)
+            {
+                // A reader finding another one saving skips its turn: the next save includes its file.
+                if (_saving || (!force && (!_checkpointDirty || _saveTimer.ElapsedMilliseconds < 1000))) return false;
+                _saving = true;
+                _checkpointDirty = false;
+                files = _cached.Values.Where(entry => !_completed.ContainsKey(entry.File.FullPath)).Concat(_completed.Values).ToList();
+            }
             string? temporary = null;
             try
             {
@@ -538,27 +596,26 @@ public sealed class DuplicateEngine
                 temporary = _checkpoint + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
-                    JsonSerializer.Serialize(stream, new Cache
-                    {
-                        Root = _root, CanonicalRoot = _canonicalRoot, SavedAt = DateTimeOffset.Now,
-                        Files = _cached.Values.Where(entry => !_completed.ContainsKey(entry.File.FullPath))
-                            .Concat(_completed.Values).ToList()
-                    });
+                    JsonSerializer.Serialize(stream, new Cache { Root = _root, CanonicalRoot = _canonicalRoot, SavedAt = DateTimeOffset.Now, Files = files });
                     stream.Flush(true);
                 }
                 ValidateCheckpoint(_checkpoint);
                 File.Move(temporary, _checkpoint, true);
-                _checkpointDirty = false;
-                _saveTimer.Restart();
+                lock (_gate) _saveTimer.Restart();
                 return true;
             }
             catch (Exception exception) when (IsFileError(exception) || exception is ArgumentException)
             {
-                _warnings.Add(L.F($"Progression non enregistrée : {exception.Message}", $"Progress was not saved: {exception.Message}"));
+                lock (_gate)
+                {
+                    _checkpointDirty = true;
+                    _warnings.Add(L.F($"Progression non enregistrée : {exception.Message}", $"Progress was not saved: {exception.Message}"));
+                }
                 return false;
             }
             finally
             {
+                lock (_gate) _saving = false;
                 if (temporary is not null)
                     try { File.Delete(temporary); } catch (Exception exception) when (IsFileError(exception)) { }
             }
@@ -595,10 +652,15 @@ public sealed class DuplicateEngine
             exception is IOException or UnauthorizedAccessException or Win32Exception or System.Security.SecurityException;
         private static string Canonical(string path) => OperatingSystem.IsWindows() ? FileSafety.CanonicalDirectory(path) : Path.GetFullPath(path);
         private void SetPhase(string phase) { _phase = phase; Report(); }
-        private void Report() => progress?.Report(new DuplicateProgress
+        private void Report()
         {
-            Phase = _phase, CurrentPath = _currentPath, FilesScanned = _filesScanned,
-            FilesHashed = _fullyHashed.Count, BytesRead = _bytesRead, FilesReused = _reused.Count, RetryAttempt = _retryAttempt
-        });
+            if (progress is null) return;
+            lock (_gate)
+                progress.Report(new DuplicateProgress
+                {
+                    Phase = _phase, CurrentPath = _currentPath, FilesScanned = _filesScanned,
+                    FilesHashed = _fullyHashed.Count, BytesRead = Interlocked.Read(ref _bytesRead), FilesReused = _reused.Count, RetryAttempt = _retryAttempt
+                });
+        }
     }
 }

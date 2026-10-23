@@ -7,6 +7,8 @@ public static class MainStrings
         new Dictionary<string, (string Fr, string En)>(StringComparer.Ordinal)
         {
             ["Main_DuplicateMode"] = ("Doublons dans un dossier…", "Duplicates in one folder…"),
+            ["Main_Snapshots"] = ("Instantanés…", "Snapshots…"),
+            ["Main_Pairs"] = ("Paires…", "Pairs…"),
             ["Main_Folder1Number"] = ("01  DOSSIER", "01  FOLDER"),
             ["Main_Folder2Number"] = ("02  DOSSIER", "02  FOLDER"),
             ["Main_Folder1"] = ("Le dossier 1", "Folder 1"),

@@ -80,14 +80,24 @@ public sealed class DuplicateRemoval
             : Task.Run(() => Remove(snapshot, selection, mode, log, progress, cancellationToken));
     }
 
-    /// <summary>Only local fixed drives have a Recycle Bin; elsewhere Windows would delete permanently.</summary>
+    /// <summary>
+    /// Only local fixed drives have a Recycle Bin; elsewhere Windows would delete permanently. The volume that
+    /// really holds the folder decides, not the letter typed: a junction, a substituted drive or a folder used
+    /// as a mount point can lead to a removable drive.
+    /// </summary>
     public static bool RecycleBinAvailable(string root)
     {
         if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(root)) return false;
         var full = Path.GetFullPath(root);
         if (full.StartsWith(@"\\", StringComparison.Ordinal)) return false;
-        var drive = Path.GetPathRoot(full);
-        return drive is not null && GetDriveTypeW(drive) == 3;
+        string real;
+        // A folder not reachable yet (still being typed) is judged by its letter; a removal always runs on a real one.
+        try { real = FileSafety.CanonicalDirectory(full); }
+        catch (Exception e) when (IsFilesystemError(e)) { real = full; }
+        if (real.StartsWith(@"\\", StringComparison.Ordinal)) return false;
+        var volume = new StringBuilder(32768);
+        return GetVolumePathNameW(Path.EndsInDirectorySeparator(real) ? real : real + Path.DirectorySeparatorChar, volume, (uint)volume.Capacity) &&
+            GetDriveTypeW(volume.ToString()) == 3;
     }
 
     private static Task<T> OnStaThread<T>(Func<T> work)
@@ -102,6 +112,10 @@ public sealed class DuplicateRemoval
         thread.Start();
         return completion.Task;
     }
+
+    /// <summary>A path inside a quarantine folder at any depth: such a copy is set aside, never kept in place of a live one.</summary>
+    public static bool IsInQuarantine(string relativePath) =>
+        relativePath.Split(['/', '\\']).SkipLast(1).Any(part => string.Equals(part, QuarantineDirectoryName, StringComparison.OrdinalIgnoreCase));
 
     internal static bool IsManagedQuarantine(string directory)
     {
@@ -153,9 +167,9 @@ public sealed class DuplicateRemoval
             var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(scan.Root));
             if (mode == DuplicateRemovalMode.RecycleBin && !RecycleBinAvailable(root))
                 throw new InvalidOperationException(L.T("Ce dossier n’a pas de Corbeille (partage réseau ou lecteur amovible) : choisissez la mise à l’écart.", "This folder has no Recycle Bin (network share or removable drive): choose to move files aside."));
-            var plan = BuildPlan(scan, root, selectedPaths);
+            var plan = BuildPlan(scan, root, selectedPaths, errors);
             if (plan.Count == 0)
-                return new DuplicateRemovalResult();
+                return new DuplicateRemovalResult { Errors = errors };
             // Opened before any change: a removal that cannot be recorded does not happen.
             log = ActionLog.Open(logPath);
             using var directories = new DirectoryLocks(root);
@@ -163,6 +177,18 @@ public sealed class DuplicateRemoval
             if (!string.Equals(canonicalRoot, scan.CanonicalRoot, StringComparison.OrdinalIgnoreCase))
                 throw new IOException(L.T("Le dossier analysé a changé de destination. Relancez la recherche.", "The scanned folder's physical location has changed. Run the search again."));
 
+            // The file is already acted on when its line is written: it is counted first, so a journal that cannot
+            // be written (full disk) loses no trace in the result, and stops every later action.
+            void Record(string action, DuplicateFile file, string hash, string keeperPath, string destination)
+            {
+                completed.Add(file.FullPath);
+                try { log!.Write(action, file.FullPath, hash, file.Size, keeperPath, destination); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    throw new StopAll(L.F($"Retiré sans ligne au journal des actions : {file.FullPath} ({e.Message}). Les actions suivantes n’ont pas été faites.",
+                        $"Removed without a line in the action journal: {file.FullPath} ({e.Message}). The following actions were not done."), e);
+                }
+            }
             foreach (var group in plan)
             {
                 token.ThrowIfCancellationRequested();
@@ -179,9 +205,10 @@ public sealed class DuplicateRemoval
                     {
                         token.ThrowIfCancellationRequested();
                         directories.PinParent(file.FullPath);
+                        // No mode shares deletion while the group is verified: a verified file cannot be renamed
+                        // away and replaced during the minutes the other files of the group take to read.
                         var stream = OpenVerified(file, group.Hash, true, canonicalRoot, token,
-                            count => { bytesVerified += count; Report(L.T("Vérification avant suppression", "Verifying before removal"), file.FullPath); },
-                            shellMayMove: mode == DuplicateRemovalMode.RecycleBin);
+                            count => { bytesVerified += count; Report(L.T("Vérification avant suppression", "Verifying before removal"), file.FullPath); });
                         opened.Add((file, stream));
                         if (!identities.Add(PhysicalIdentity(FileSafety.Identity(stream.SafeFileHandle)!)))
                             throw new IOException(L.T("Plusieurs chemins désignent le même fichier physique. Aucun fichier de ce groupe n’a été supprimé.", "Several paths refer to the same physical file. No file in this group has been removed."));
@@ -194,8 +221,13 @@ public sealed class DuplicateRemoval
                         {
                             if (quarantineSession is null)
                             {
-                                quarantineSession = CreateQuarantine(root, directories);
-                                manifest = CreateManifest(quarantineSession, root);
+                                // Without a quarantine no group can be moved aside: that stops everything, once.
+                                try
+                                {
+                                    quarantineSession = CreateQuarantine(root, directories);
+                                    manifest = CreateManifest(quarantineSession, root, canonicalRoot);
+                                }
+                                catch (Exception e) when (IsFilesystemError(e)) { throw new StopAll(e.Message, e); }
                             }
                             var destination = Path.Combine(quarantineSession, item.File.RelativePath);
                             directories.CreateAndPinParent(destination);
@@ -205,37 +237,50 @@ public sealed class DuplicateRemoval
                             RenameByHandle(item.Stream.SafeFileHandle, parent, Path.GetFileName(destination));
                             item.Stream.Dispose();
                             bytesMoved += item.File.Size;
-                            log.Write(L.T("Mis à l’écart", "Moved aside"), item.File.FullPath, group.Hash, item.File.Size, group.Keeper.FullPath, destination);
+                            Record(L.T("Mis à l’écart", "Moved aside"), item.File, group.Hash, group.Keeper.FullPath, destination);
                         }
                         else if (mode == DuplicateRemovalMode.RecycleBin)
                         {
+                            // The shell works on a path. A second handle, sharing deletion, follows the verified file:
+                            // it must be the same file at the same place, and only then is the locked handle released,
+                            // microseconds before the shell opens the path.
+                            var expected = Path.Combine(canonicalRoot, item.File.RelativePath);
+                            using var follower = OpenFollower(item.File.FullPath);
+                            if (FileSafety.Identity(follower) is not { } followed || PhysicalIdentity(followed) != PhysicalIdentity(FileSafety.Identity(item.Stream.SafeFileHandle)!) ||
+                                !string.Equals(FinalPath(follower), expected, StringComparison.OrdinalIgnoreCase))
+                                throw new IOException(L.F($"« {item.File.RelativePath} » a changé entre sa vérification et la mise à la Corbeille : rien n’a été retiré de ce groupe.", $"‘{item.File.RelativePath}’ changed between its verification and the Recycle Bin: nothing was removed from this group."));
+                            item.Stream.Dispose();
                             Recycle(item.File.FullPath);
-                            var outcome = RecycledOutcome(item.Stream.SafeFileHandle, Path.Combine(canonicalRoot, item.File.RelativePath));
+                            string? outcome;
+                            try { outcome = RecycledOutcome(follower, expected); }
+                            catch (IOException incident)
+                            {
+                                // Something replaced the file in the last microseconds: say so, and where the verified file went.
+                                log.Write(L.T("Incident : autre élément peut-être mis à la Corbeille", "Incident: another item may have gone to the Recycle Bin"), item.File.FullPath, group.Hash, item.File.Size, group.Keeper.FullPath, incident.Message);
+                                throw;
+                            }
                             if (outcome is null)
                                 throw new OperationCanceledException(L.T("Mise à la Corbeille annulée dans la fenêtre de Windows.", "Moving to the Recycle Bin was cancelled in the Windows dialog."));
-                            item.Stream.Dispose();
                             if (outcome.Length > 0)
                             {
                                 bytesRecycled += item.File.Size;
-                                log.Write(L.T("Mis à la Corbeille", "Moved to the Recycle Bin"), item.File.FullPath, group.Hash, item.File.Size, group.Keeper.FullPath, outcome);
+                                Record(L.T("Mis à la Corbeille", "Moved to the Recycle Bin"), item.File, group.Hash, group.Keeper.FullPath, outcome);
                             }
                             else
                             {
                                 bytesRemoved += item.File.Size;
                                 warnings.Add(L.F($"Trop volumineux pour la Corbeille, supprimé définitivement après confirmation dans Windows : {item.File.FullPath}", $"Too large for the Recycle Bin, deleted permanently after confirmation in Windows: {item.File.FullPath}"));
-                                log.Write(L.T("Supprimé définitivement (trop volumineux pour la Corbeille)", "Deleted permanently (too large for the Recycle Bin)"), item.File.FullPath, group.Hash, item.File.Size, group.Keeper.FullPath, "");
+                                Record(L.T("Supprimé définitivement (trop volumineux pour la Corbeille)", "Deleted permanently (too large for the Recycle Bin)"), item.File, group.Hash, group.Keeper.FullPath, "");
                             }
                         }
                         else
                         {
-                            byte remove = 1;
-                            if (!SetFileInformationByHandle(item.Stream.SafeFileHandle, 4, ref remove, 1))
+                            if (!DeleteVerified(item.Stream.SafeFileHandle))
                                 throw new Win32Exception(Marshal.GetLastWin32Error(), L.T("Windows a refusé la suppression du fichier vérifié.", "Windows refused to delete the verified file."));
                             item.Stream.Dispose();
                             bytesRemoved += item.File.Size;
-                            log.Write(L.T("Supprimé définitivement", "Deleted permanently"), item.File.FullPath, group.Hash, item.File.Size, group.Keeper.FullPath, "");
+                            Record(L.T("Supprimé définitivement", "Deleted permanently"), item.File, group.Hash, group.Keeper.FullPath, "");
                         }
-                        completed.Add(item.File.FullPath);
                         Report(mode switch
                         {
                             DuplicateRemovalMode.Quarantine => L.T("Doublon mis à l’écart", "Duplicate quarantined"),
@@ -244,6 +289,9 @@ public sealed class DuplicateRemoval
                         }, item.File.FullPath);
                     }
                 }
+                // Refused for this group only (contents changed, hard links, a link on the way, Windows refusing):
+                // the other groups are still processed. A journal or quarantine failure stops everything.
+                catch (Exception e) when (IsFilesystemError(e) && e is not StopAll) { errors.Add(e.Message); }
                 finally
                 {
                     foreach (var item in opened) item.Stream.Dispose();
@@ -257,8 +305,11 @@ public sealed class DuplicateRemoval
         }
         finally
         {
-            manifest?.Dispose();
-            log?.Dispose();
+            // Each closes on its own: a failure of the first never leaves the second open or hides the result.
+            try { manifest?.Dispose(); }
+            catch (Exception e) when (IsFilesystemError(e)) { errors.Add(L.F($"Manifeste de la mise à l’écart incomplet : {e.Message}", $"Quarantine manifest incomplete: {e.Message}")); }
+            try { log?.Dispose(); }
+            catch (Exception e) when (IsFilesystemError(e)) { errors.Add(L.F($"Journal des actions incomplet : {e.Message}", $"Action journal incomplete: {e.Message}")); }
         }
         return new DuplicateRemovalResult
         {
@@ -267,8 +318,9 @@ public sealed class DuplicateRemoval
         };
     }
 
+    /// <summary>Groups to process. A group whose selection or only kept copy is in a quarantine is skipped with a reason.</summary>
     private static List<RemovalGroup> BuildPlan(DuplicateResult scan, string root,
-        IReadOnlyCollection<string> selectedPaths)
+        IReadOnlyCollection<string> selectedPaths, List<string> refusals)
     {
         var selection = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var selected in selectedPaths)
@@ -290,9 +342,19 @@ public sealed class DuplicateRemoval
             }
             var selected = group.Files.Where(file => selection.Contains(Path.GetFullPath(file.FullPath))).ToList();
             if (selected.Count == 0) continue;
-            var keeper = group.Files.FirstOrDefault(file => !selection.Contains(Path.GetFullPath(file.FullPath)));
-            if (keeper is null)
+            var kept = group.Files.Where(file => !selection.Contains(Path.GetFullPath(file.FullPath))).ToList();
+            if (kept.Count == 0)
                 throw new InvalidOperationException(L.T("Conservez au moins un fichier de chaque groupe de doublons.", "Keep at least one file in each duplicate group."));
+            if (selected.FirstOrDefault(file => IsInQuarantine(file.RelativePath)) is { } aside)
+            {
+                refusals.Add(L.F($"Groupe ignoré : « {aside.RelativePath} » est dans une mise à l’écart. Utilisez « Restaurer » plutôt que de le retirer.", $"Group skipped: ‘{aside.RelativePath}’ is in a quarantine. Use Restore rather than removing it."));
+                continue;
+            }
+            if (kept.FirstOrDefault(file => !IsInQuarantine(file.RelativePath)) is not { } keeper)
+            {
+                refusals.Add(L.F($"Groupe ignoré : la seule copie conservée serait dans une mise à l’écart (« {kept[0].RelativePath} »).", $"Group skipped: the only kept copy would be in a quarantine (‘{kept[0].RelativePath}’)."));
+                continue;
+            }
             groups.Add(new RemovalGroup(group.Hash, keeper, selected));
         }
         if (selection.Any(path => !known.Contains(path)))
@@ -307,18 +369,29 @@ public sealed class DuplicateRemoval
             !Path.IsPathFullyQualified(file.FullPath) || file.Size < 0 ||
             !FileSafety.IsWithin(root, file.FullPath) ||
             !string.Equals(Path.GetFullPath(Path.Combine(root, file.RelativePath)), Path.GetFullPath(file.FullPath),
-                StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(file.RelativePath.Split(['/', '\\'])[0], QuarantineDirectoryName, StringComparison.OrdinalIgnoreCase))
+                StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException(L.T("Le chemin d’un doublon est invalide ou sort du dossier analysé.", "A duplicate's path is invalid or outside the scanned folder."));
     }
 
-    private static FileStream OpenVerified(DuplicateFile file, string hash, bool forRemoval,
-        string canonicalRoot, CancellationToken token, Action<int> onBytes, bool shellMayMove = false)
+    /// <summary>An attributes-only handle that lets the shell move or delete the file, then tells where it went.</summary>
+    private static SafeFileHandle OpenFollower(string path)
     {
-        // Writers are always denied. Only the Recycle Bin mode lets the shell move the verified file;
-        // the outcome is then checked through this same handle.
-        var handle = CreateFileW(file.FullPath, GenericRead | (forRemoval && !shellMayMove ? DeleteAccess : 0),
-            shellMayMove ? FileShare.Read | FileShare.Delete : FileShare.Read, IntPtr.Zero, 3, OpenReparsePoint | SequentialScan, IntPtr.Zero);
+        var handle = CreateFileW(FileSafety.Native(path), 0x80, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, 3, OpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, L.F($"Impossible de suivre « {path} » pendant la mise à la Corbeille.", $"Unable to follow ‘{path}’ while moving it to the Recycle Bin."));
+        }
+        return handle;
+    }
+
+    private static FileStream OpenVerified(DuplicateFile file, string hash, bool forRemoval,
+        string canonicalRoot, CancellationToken token, Action<int> onBytes)
+    {
+        // Writers, renames and deletions by others are denied while the file is verified and until it is acted on.
+        var handle = CreateFileW(FileSafety.Native(file.FullPath), GenericRead | (forRemoval ? DeleteAccess : 0),
+            FileShare.Read, IntPtr.Zero, 3, OpenReparsePoint | SequentialScan, IntPtr.Zero);
         if (handle.IsInvalid)
         {
             var error = Marshal.GetLastWin32Error();
@@ -395,7 +468,7 @@ public sealed class DuplicateRemoval
         }
         else
         {
-            if (!CreateDirectoryW(quarantine, IntPtr.Zero))
+            if (!CreateDirectoryW(FileSafety.Native(quarantine), IntPtr.Zero))
                 throw new Win32Exception(Marshal.GetLastWin32Error(), L.T("Impossible de créer une quarantaine réservée à Checker San.", "Unable to create a quarantine reserved for Checker San."));
             directories.Pin(quarantine);
             using var marker = new FileStream(Path.Combine(quarantine, MarkerName), FileMode.CreateNew, FileAccess.Write, FileShare.None);
@@ -404,7 +477,7 @@ public sealed class DuplicateRemoval
             marker.Flush(true);
         }
         var session = Path.Combine(quarantine, Guid.NewGuid().ToString("N"));
-        if (!CreateDirectoryW(session, IntPtr.Zero))
+        if (!CreateDirectoryW(FileSafety.Native(session), IntPtr.Zero))
             throw new Win32Exception(Marshal.GetLastWin32Error(), L.T("Impossible de créer une session de quarantaine.", "Unable to create a quarantine session."));
         directories.Pin(session);
         return session;
@@ -412,31 +485,9 @@ public sealed class DuplicateRemoval
 
     private static void RenameByHandle(SafeFileHandle file, SafeFileHandle destinationDirectory, string name)
     {
-        var bytes = Encoding.Unicode.GetBytes(name);
-        var rootOffset = IntPtr.Size == 8 ? 8 : 4;
-        var lengthOffset = rootOffset + IntPtr.Size;
-        var nameOffset = lengthOffset + sizeof(uint);
-        var memory = Marshal.AllocHGlobal(nameOffset + bytes.Length);
-        try
-        {
-            // FILE_RENAME_INFORMATION: ReplaceIfExists stays false; the pinned
-            // directory handle binds the destination to the folder checked above.
-            // The Win32 wrapper normalizes relative names against the process
-            // directory on some Windows versions. The native API preserves the
-            // supplied RootDirectory, avoiding a fallback to a path-based move.
-            for (var i = 0; i < nameOffset; i++) Marshal.WriteByte(memory, i, 0);
-            Marshal.WriteIntPtr(memory, rootOffset, destinationDirectory.DangerousGetHandle());
-            Marshal.WriteInt32(memory, lengthOffset, bytes.Length);
-            Marshal.Copy(bytes, 0, memory + nameOffset, bytes.Length);
-            var status = NtSetInformationFile(file, out _, memory, (uint)(nameOffset + bytes.Length), 10);
-            if (status != 0)
-            {
-                var error = unchecked((int)RtlNtStatusToDosError(status));
-                throw new Win32Exception(error, L.F($"Windows a refusé la mise à l’écart (code {error}) ; aucune suppression définitive n’a été tentée.", $"Windows refused to quarantine the file (code {error}); permanent deletion was not attempted."));
-            }
-            GC.KeepAlive(destinationDirectory);
-        }
-        finally { Marshal.FreeHGlobal(memory); }
+        var error = FileSafety.RenameByHandle(file, destinationDirectory, name);
+        if (error != 0)
+            throw new Win32Exception(error, L.F($"Windows a refusé la mise à l’écart (code {error}) ; aucune suppression définitive n’a été tentée.", $"Windows refused to quarantine the file (code {error}); permanent deletion was not attempted."));
     }
 
     private static string FinalPath(SafeFileHandle handle)
@@ -479,7 +530,10 @@ public sealed class DuplicateRemoval
             foreach (var manifestPath in Directory.EnumerateFiles(quarantine, "*" + ManifestSuffix))
             {
                 var session = manifestPath[..^ManifestSuffix.Length];
-                if (ReadManifest(manifestPath) is not { } manifest) continue;
+                // A session or manifest replaced by a link is not one Checker San made: it is never offered.
+                // Only sessions that Restore would accept: offering one it then refuses would mislead.
+                if (IsLink(manifestPath) || !Directory.Exists(session) || IsLink(session) || ReadManifest(manifestPath) is not { } manifest ||
+                    !Belongs(manifest.Header, Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)))) continue;
                 var waiting = manifest.Entries.Count(entry => File.Exists(Path.Combine(session, entry.RelativePath)));
                 if (waiting > 0) sessions.Add(new QuarantineSession(session, manifest.Header.CreatedAt, manifest.Entries.Count, waiting));
             }
@@ -505,29 +559,49 @@ public sealed class DuplicateRemoval
         var session = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sessionPath));
         var quarantine = Path.GetDirectoryName(session)!;
         var root = Path.GetDirectoryName(quarantine)!;
-        if (!IsManagedQuarantine(quarantine) || ReadManifest(session + ManifestSuffix) is not { } manifest ||
-            !string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(manifest.Header.Root)), root, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException(L.T("Cette mise à l’écart ne peut pas être restaurée : son manifeste est absent ou concerne un autre dossier.", "These files cannot be restored: the manifest is missing or belongs to another folder."));
-        using var log = ActionLog.Open(logPath);
-        foreach (var entry in manifest.Entries)
+        if (!IsManagedQuarantine(quarantine) || IsLink(session) || IsLink(session + ManifestSuffix) || ReadManifest(session + ManifestSuffix) is not { } manifest)
+            throw new InvalidOperationException(L.T("Cette mise à l’écart ne peut pas être restaurée : son manifeste est absent ou illisible.", "These files cannot be restored: the manifest is missing or unreadable."));
+        if (!Belongs(manifest.Header, root))
+            throw new InvalidOperationException(L.F($"Cette mise à l’écart concerne « {manifest.Header.Root} » : rouvrez ce dossier pour la restaurer.", $"These files were moved aside from ‘{manifest.Header.Root}’: open that folder to restore them."));
+        var log = ActionLog.Open(logPath);
+        try
         {
-            token.ThrowIfCancellationRequested();
-            var stored = Path.Combine(session, entry.RelativePath);
-            var original = Path.Combine(root, entry.RelativePath);
-            if (!File.Exists(stored)) continue;
-            try
+            using (var directories = new DirectoryLocks(root))
             {
-                if (File.Exists(original) || Directory.Exists(original))
-                    throw new IOException(L.F($"Un élément occupe déjà « {entry.RelativePath} » : le fichier reste dans la mise à l’écart.", $"Something already occupies ‘{entry.RelativePath}’: the file stays aside."));
-                using (var check = new FileStream(stored, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    if (check.Length != entry.Size || !string.Equals(Convert.ToHexString(SHA256.HashData(check)), entry.Hash, StringComparison.OrdinalIgnoreCase))
-                        throw new IOException(L.F($"« {entry.RelativePath} » a changé depuis sa mise à l’écart : il n’est pas restauré.", $"‘{entry.RelativePath}’ changed after being moved aside: it is not restored."));
-                CreateFoldersWithoutLinks(root, Path.GetDirectoryName(original)!);
-                File.Move(stored, original, overwrite: false);
-                restored++;
-                log.Write(L.T("Restauré", "Restored"), stored, entry.Hash, entry.Size, "", original);
+                // Every folder used is pinned without following links and cannot be renamed or replaced meanwhile,
+                // so a junction planted in the quarantine can never lead a file in from outside the scanned folder.
+                directories.Pin(session);
+                var canonicalSession = FileSafety.CanonicalDirectory(session);
+                foreach (var entry in manifest.Entries)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var stored = Path.Combine(session, entry.RelativePath);
+                    var original = Path.Combine(root, entry.RelativePath);
+                    if (!File.Exists(stored)) continue;
+                    try
+                    {
+                        directories.PinParent(stored);
+                        if (File.Exists(original) || Directory.Exists(original))
+                            throw new IOException(L.F($"Un élément occupe déjà « {entry.RelativePath} » : le fichier reste dans la mise à l’écart.", $"Something already occupies ‘{entry.RelativePath}’: the file stays aside."));
+                        // The stream owns the handle: it stays open until the rename, so the file checked is the file moved.
+                        using var file = new FileStream(OpenStored(stored, Path.Combine(canonicalSession, entry.RelativePath)), FileAccess.Read, 1024 * 1024, false);
+                        if (file.Length != entry.Size || !string.Equals(Convert.ToHexString(SHA256.HashData(file)), entry.Hash, StringComparison.OrdinalIgnoreCase))
+                            throw new IOException(L.F($"« {entry.RelativePath} » a changé depuis sa mise à l’écart : il n’est pas restauré.", $"‘{entry.RelativePath}’ changed after being moved aside: it is not restored."));
+                        directories.CreateAndPinParent(original);
+                        var error = FileSafety.RenameByHandle(file.SafeFileHandle, directories.Pin(Path.GetDirectoryName(original)!), Path.GetFileName(original));
+                        if (error != 0) throw new Win32Exception(error, L.F($"Windows a refusé de restaurer « {entry.RelativePath} » (code {error}).", $"Windows refused to restore ‘{entry.RelativePath}’ (code {error})."));
+                        restored++;
+                        log.Write(L.T("Restauré", "Restored"), stored, entry.Hash, entry.Size, "", original);
+                    }
+                    catch (Exception e) when (IsFilesystemError(e)) { errors.Add(e.Message); }
+                }
             }
-            catch (Exception e) when (IsFilesystemError(e)) { errors.Add(e.Message); }
+        }
+        finally
+        {
+            // A journal that cannot be closed never hides what was restored.
+            try { log.Dispose(); }
+            catch (Exception e) when (IsFilesystemError(e)) { errors.Add(L.F($"Journal des actions incomplet : {e.Message}", $"Action journal incomplete: {e.Message}")); }
         }
         RemoveEmptyFolders(session);
         if (!Directory.Exists(session))
@@ -538,17 +612,54 @@ public sealed class DuplicateRemoval
         return new RestoreResult(restored, errors);
     }
 
-    private static void CreateFoldersWithoutLinks(string root, string directory)
+    /// <summary>A failure that ends the whole removal: the journal cannot be written, or no quarantine can be made.</summary>
+    private sealed class StopAll(string message, Exception inner) : IOException(message, inner);
+
+    /// <summary>
+    /// Deletes through the verified handle. FileDispositionInfoEx ignores the read-only attribute, which a copy from a
+    /// CD or a camera often carries; older file systems fall back to the plain request.
+    /// </summary>
+    private static bool DeleteVerified(SafeFileHandle handle)
     {
-        var current = root;
-        foreach (var part in Path.GetRelativePath(root, directory).Split(Path.DirectorySeparatorChar))
+        uint flags = 0x1 | 0x10; // FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE
+        if (SetFileInformationByHandle(handle, 21, ref flags, sizeof(uint))) return true;
+        if (Marshal.GetLastWin32Error() is not (87 or 50 or 1)) return false;
+        byte remove = 1;
+        return SetFileInformationByHandle(handle, 4, ref remove, 1);
+    }
+
+    private static bool IsLink(string path)
+    {
+        try { return FileSafety.Access(path, File.GetAttributes(path)) == EntryAccess.Link; }
+        catch (Exception e) when (IsFilesystemError(e)) { return false; }
+    }
+
+    /// <summary>
+    /// A quarantined file opened without following links, with the right to rename it: it must be a plain file,
+    /// with no other name, at exactly its place inside the session.
+    /// </summary>
+    private static SafeFileHandle OpenStored(string stored, string expected)
+    {
+        var handle = CreateFileW(FileSafety.Native(stored), GenericRead | DeleteAccess, FileShare.Read, IntPtr.Zero, 3, OpenReparsePoint | SequentialScan, IntPtr.Zero);
+        if (handle.IsInvalid)
         {
-            if (part == ".") continue;
-            current = Path.Combine(current, part);
-            if (!Directory.Exists(current) && !File.Exists(current)) Directory.CreateDirectory(current);
-            var attributes = File.GetAttributes(current);
-            if ((attributes & FileAttributes.Directory) == 0 || FileSafety.Access(current, attributes) == EntryAccess.Link)
-                throw new IOException(L.F($"Un fichier ou un lien occupe le dossier d’origine : {current}", $"A file or link occupies the original folder: {current}"));
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, L.F($"Impossible d’ouvrir « {stored} ».", $"Unable to open ‘{stored}’."));
+        }
+        try
+        {
+            if (!GetFileInformationByHandleEx(handle, 0, out BasicInfo info, (uint)Marshal.SizeOf<BasicInfo>()) ||
+                ((FileAttributes)info.Attributes & FileAttributes.Directory) != 0 || FileSafety.Access(handle) != EntryAccess.Normal ||
+                DuplicateEngine.HardLinkCount(handle) != 1 ||
+                !string.Equals(FinalPath(handle), expected, StringComparison.OrdinalIgnoreCase))
+                throw new IOException(L.F($"« {stored} » n’est plus le fichier mis à l’écart (lien, autre nom ou autre emplacement) : il n’est pas restauré.", $"‘{stored}’ is no longer the file moved aside (link, other name or other place): it is not restored."));
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
         }
     }
 
@@ -556,6 +667,8 @@ public sealed class DuplicateRemoval
     {
         try
         {
+            // The session itself is checked too: a link put in its place is never walked into.
+            if (IsLink(directory)) return;
             foreach (var child in Directory.EnumerateDirectories(directory))
                 if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0) RemoveEmptyFolders(child);
             // A non-recursive delete fails on anything left inside.
@@ -564,11 +677,23 @@ public sealed class DuplicateRemoval
         catch (Exception e) when (IsFilesystemError(e)) { }
     }
 
-    private static FileStream CreateManifest(string session, string root)
+    private static FileStream CreateManifest(string session, string root, string canonicalRoot)
     {
         var stream = new FileStream(session + ManifestSuffix, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
-        AppendLine(stream, JsonSerializer.SerializeToUtf8Bytes(new ManifestHeader { Root = root, CreatedAt = DateTimeOffset.Now }));
+        AppendLine(stream, JsonSerializer.SerializeToUtf8Bytes(new ManifestHeader { Root = root, CanonicalRoot = canonicalRoot, CreatedAt = DateTimeOffset.Now }));
         return stream;
+    }
+
+    /// <summary>
+    /// Whether a manifest belongs to the folder opened now: same spelling, or same real folder reached another way
+    /// (mapped drive and share, junction, short name). Manifests without a real path compare their spelling only.
+    /// </summary>
+    private static bool Belongs(ManifestHeader header, string root)
+    {
+        if (string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(header.Root)), root, StringComparison.OrdinalIgnoreCase)) return true;
+        if (header.CanonicalRoot is null) return false;
+        try { return string.Equals(FileSafety.CanonicalDirectory(root), header.CanonicalRoot, StringComparison.OrdinalIgnoreCase); }
+        catch (Exception e) when (IsFilesystemError(e)) { return false; }
     }
 
     private static void AppendManifest(FileStream manifest, ManifestEntry entry) => AppendLine(manifest, JsonSerializer.SerializeToUtf8Bytes(entry));
@@ -611,6 +736,8 @@ public sealed class DuplicateRemoval
     {
         public int Schema { get; init; } = 1;
         public string Root { get; init; } = "";
+        /// <summary>The real path of the root when the files were moved aside; absent from earlier manifests.</summary>
+        public string? CanonicalRoot { get; init; }
         public DateTimeOffset CreatedAt { get; init; }
     }
 
@@ -674,7 +801,7 @@ public sealed class DuplicateRemoval
             if (_handles.TryGetValue(directory, out var existing)) return existing;
             if (!string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase))
                 Pin(Path.GetDirectoryName(directory)!);
-            var handle = CreateFileW(directory, 0x80, FileShare.ReadWrite, IntPtr.Zero, 3,
+            var handle = CreateFileW(FileSafety.Native(directory), 0x80, FileShare.ReadWrite, IntPtr.Zero, 3,
                 BackupSemantics | OpenReparsePoint, IntPtr.Zero);
             if (handle.IsInvalid)
             {
@@ -687,7 +814,7 @@ public sealed class DuplicateRemoval
                 FileSafety.Access(handle) == EntryAccess.Link)
             {
                 handle.Dispose();
-                throw new IOException(L.T("Une jonction ou un lien ne peut pas être utilisé pour supprimer des doublons.", "A junction or link cannot be used to remove duplicates."));
+                throw new IOException(L.F($"Un lien ou une jonction se trouve sur le chemin, et il n’est jamais suivi : {directory}", $"A link or junction is on the way, and it is never followed: {directory}"));
             }
             _handles.Add(directory, handle);
             return handle;
@@ -716,17 +843,14 @@ public sealed class DuplicateRemoval
     private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint capacity, uint flags);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref byte info, uint size);
-    [StructLayout(LayoutKind.Sequential)] private struct IoStatusBlock
-    { public IntPtr Status; public UIntPtr Information; }
-    [DllImport("ntdll.dll", ExactSpelling = true)]
-    private static extern int NtSetInformationFile(SafeFileHandle handle, out IoStatusBlock ioStatus,
-        IntPtr information, uint length, int informationClass);
-    [DllImport("ntdll.dll", ExactSpelling = true)]
-    private static extern uint RtlNtStatusToDosError(int status);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref uint info, uint size);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern bool CreateDirectoryW(string path, IntPtr security);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     private static extern uint GetDriveTypeW(string root);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern bool GetVolumePathNameW(string path, StringBuilder volume, uint length);
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct ShellFileOperation
     {

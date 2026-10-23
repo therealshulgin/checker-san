@@ -17,6 +17,8 @@ public sealed record ComparisonOptions(bool FindMovedFiles = true)
     public string? CheckpointPath { get; init; }
     public int MaxRetries { get; init; } = 3;
     public int InitialRetryDelayMs { get; init; } = 1000;
+    /// <summary>Files read at once per disk; null chooses 4 on an internal SSD and 1 elsewhere (hard disk, USB, share).</summary>
+    public int? ParallelReads { get; init; }
 }
 
 public sealed record CheckpointInfo

@@ -19,7 +19,8 @@ internal sealed record CheckpointData
         try
         {
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-            if (stream.Length > 128L * 1024 * 1024) return null;
+            // About 400 bytes per file: 1 GiB is some two and a half million hashes, beyond any folder pair checked here.
+            if (stream.Length > 1024L * 1024 * 1024) return null;
             var data = JsonSerializer.Deserialize<CheckpointData>(stream);
             return data is { Schema: 1, Algorithm: "SHA256", Files: not null } &&
                 !string.IsNullOrWhiteSpace(data.SourceRoot) && !string.IsNullOrWhiteSpace(data.TargetRoot) &&

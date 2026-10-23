@@ -22,7 +22,7 @@ public sealed class CopyDialog : Window
         var panel = new DockPanel { Margin = new Thickness(24) };
         var heading = new StackPanel();
         heading.Children.Add(new TextBlock { Text = L.T("Compléter les dossiers", "Complete folders"), FontSize = 25, FontWeight = FontWeights.SemiBold });
-        heading.Children.Add(new TextBlock { Text = L.T("Ajoutez les fichiers et dossiers absents de chaque côté, ou choisissez un seul sens. Les originaux restent à leur place et les fichiers existants ne sont jamais écrasés.", "Add missing files and folders on both sides, or choose one direction. Originals stay in place and existing files are never overwritten."), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 16), Foreground = RowView.Brush("#ACACAC") });
+        heading.Children.Add(new TextBlock { Text = L.T("Ajoutez les fichiers et dossiers absents de chaque côté, ou choisissez un seul sens. Les originaux restent à leur place et les fichiers existants ne sont jamais écrasés. Dates, attributs et marque du Web sont conservés ; les autres flux NTFS et les autorisations ne sont pas copiés.", "Add missing files and folders on both sides, or choose one direction. Originals stay in place and existing files are never overwritten. Dates, attributes and the mark of the Web are kept; other NTFS streams and permissions are not copied."), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 16), Foreground = RowView.Brush("#ACACAC") });
         var direction = new ComboBox { Height = 40, DisplayMemberPath = nameof(Choice.Label) };
         RegisterName("DirectionBox", direction);
         bool canCreate = result is not null && CopyEngine.CanCreatePlan(result);
@@ -51,18 +51,27 @@ public sealed class CopyDialog : Window
         if (canResume) heading.Children.Add(new TextBlock { Text = L.T("Une copie incomplète est enregistrée. Reprenez-la pour conserver son avancement ; lancer une autre copie remplacera son journal.", "An incomplete copy is saved. Resume it to keep its progress; starting another copy replaces its journal."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#E8C395"), Margin = new Thickness(0, 0, 0, 12) });
         DockPanel.SetDock(heading, Dock.Top); panel.Children.Add(heading);
         var footer = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) };
+        var export = new Button { Content = L.T("Exporter la liste…", "Export the list…"), IsEnabled = false, Margin = new Thickness(0, 0, 9, 0), ToolTip = L.T("Enregistre en CSV ce qui serait copié, sans rien copier.", "Saves what would be copied as CSV, without copying anything.") };
         var cancel = new Button { Content = L.T("Annuler", "Cancel"), IsCancel = true, Margin = new Thickness(0, 0, 9, 0) };
         var start = new Button { Content = L.T("Lancer la copie", "Start copying"), IsEnabled = false, Style = (Style)Application.Current.FindResource("PrimaryButton") };
-        RegisterName("StartCopyButton", start);
-        footer.Children.Add(cancel); footer.Children.Add(start); DockPanel.SetDock(footer, Dock.Bottom); panel.Children.Add(footer);
+        RegisterName("StartCopyButton", start); RegisterName("ExportPlanButton", export);
+        footer.Children.Add(export); footer.Children.Add(cancel); footer.Children.Add(start); DockPanel.SetDock(footer, Dock.Bottom); panel.Children.Add(footer);
         var list = new ListBox { Background = RowView.Brush("#101010"), Foreground = Foreground, BorderBrush = RowView.Brush("#333333"), Padding = new Thickness(10) };
         RegisterName("PreviewList", list);
         panel.Children.Add(list); Content = panel;
         cancel.Click += (_, _) => Close();
         start.Click += (_, _) => { if (Plan != null) { DialogResult = true; Close(); } };
+        export.Click += (_, _) =>
+        {
+            if (Plan is not { } plan) return;
+            var save = new Microsoft.Win32.SaveFileDialog { Title = L.T("Exporter ce qui serait copié", "Export what would be copied"), FileName = $"copy preview {DateTime.Now:yyyy-MM-dd HHmm}.csv", Filter = "CSV (*.csv)|*.csv", AddExtension = true, OverwritePrompt = false };
+            if (save.ShowDialog(this) != true) return;
+            try { CopyPlanWriter.Write(save.FileName, plan); }
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception) { MessageBox.Show(this, ex.Message, "Checker San"); }
+        };
         direction.SelectionChanged += async (_, _) =>
         {
-            var version = ++_version; start.IsEnabled = false; Plan = null; list.ItemsSource = null; summary.Text = L.T("Préparation du récapitulatif…", "Preparing preview…");
+            var version = ++_version; start.IsEnabled = export.IsEnabled = false; Plan = null; list.ItemsSource = null; summary.Text = L.T("Préparation du récapitulatif…", "Preparing preview…");
             if (direction.SelectedItem is not Choice choice) return;
             try
             {
@@ -86,7 +95,12 @@ public sealed class CopyDialog : Window
                 var enough = needs.All(need => need.Sufficient);
                 if (!enough) summary.Text += L.T("\nEspace insuffisant : libérez de la place avant de lancer la copie.", "\nNot enough space: free some space before starting the copy.");
                 start.IsEnabled = plan.Items.Count > 0 && enough;
+                export.IsEnabled = plan.Items.Count > 0;
                 if (plan.Items.Count == 0) summary.Text += L.T("\nAucun chemin manquant à copier dans ce sens.", "\nNo missing paths to copy in this direction.");
+                if (plan.UnsupportedNames > 0)
+                    summary.Text += L.F($"\n{plan.UnsupportedNames:N0} chemin(s) au nom que Windows modifierait (point ou espace final, nom réservé ou mal formé) écarté(s) : à copier à la main.", $"\n{plan.UnsupportedNames:N0} path(s) with a name Windows would alter (final dot or space, reserved or malformed name) left out: copy them by hand.");
+                if (plan.AbandonedTemporaries > 0)
+                    summary.Text += L.F($"\n{plan.AbandonedTemporaries:N0} fichier(s) temporaire(s) d’une copie interrompue écarté(s) : ils ne sont jamais recopiés.", $"\n{plan.AbandonedTemporaries:N0} temporary file(s) from an interrupted copy left out: they are never copied over.");
             }
             catch (Exception ex) { if (version == _version) summary.Text = ex.Message; }
         };

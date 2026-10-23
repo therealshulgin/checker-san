@@ -12,6 +12,8 @@ public sealed record DuplicateScanOptions
     public IReadOnlyList<string> ExcludedNames { get; init; } = [];
     /// <summary>Leaves out hidden or system files and folders, which Windows and applications maintain.</summary>
     public bool SkipHiddenAndSystem { get; init; }
+    /// <summary>Files read at once; null chooses 4 on an internal SSD and 1 elsewhere (hard disk, USB, share).</summary>
+    public int? ParallelReads { get; init; }
 
     /// <summary>Metadata files that Windows and macOS create in many folders.</summary>
     public static IReadOnlyList<string> DefaultExcludedNames { get; } = ["Thumbs.db", "desktop.ini", ".DS_Store"];

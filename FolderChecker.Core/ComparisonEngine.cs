@@ -50,9 +50,12 @@ public sealed class ComparisonEngine
         private readonly HashSet<string> _errors = new(StringComparer.Ordinal);
         private readonly HashSet<string> _warnings = new(StringComparer.Ordinal);
         private readonly Dictionary<string, CheckpointFile> _checkpointFiles = new(StringComparer.OrdinalIgnoreCase);
+        // Identity of each file when its hash was proven, checked again by handle at the final check.
+        private readonly Dictionary<string, (Entry Entry, FileIdentity Identity)> _readIdentities = new(StringComparer.OrdinalIgnoreCase);
         private readonly Stopwatch _progressTimer = Stopwatch.StartNew();
         private readonly Stopwatch _checkpointTimer = Stopwatch.StartNew();
-        private long _filesDiscovered, _filesHashed, _bytesHashed, _sampleBytesRead, _totalHashBytes, _filesReused;
+        private long _filesDiscovered, _filesHashed, _bytesHashed, _sampleBytesRead, _totalHashBytes, _filesReused, _lastSaveMilliseconds;
+        private int _savedEntries;
         private const long SampleThreshold = 4 * 1024 * 1024;
         private const int SampleBlockSize = 64 * 1024;
         private int _retryAttempt;
@@ -61,6 +64,10 @@ public sealed class ComparisonEngine
         private bool _hasCheckpoint, _checkpointSaved, _checkpointDirty;
         private string _phase = L.T("Préparation", "Preparing");
         private string _currentPath = "";
+        // Guards the shared caches, counters and checkpoint while several files are read at once.
+        private readonly object _gate = new();
+        private bool _saving;
+        private DeviceReaders? _readers;
 
         public async Task<ComparisonResult> ExecuteAsync()
         {
@@ -80,6 +87,7 @@ public sealed class ComparisonEngine
                 sourceSnapshot = new Snapshot(sourceRoot);
                 targetSnapshot = new Snapshot(targetRoot);
                 await RetryIoAsync(() => { ValidateSeparateRoots(sourceRoot, targetRoot); return true; }, sourceRoot);
+                _readers = new DeviceReaders([sourceRoot, targetRoot], options.ParallelReads);
                 await PrepareCheckpointAsync(sourceRoot, targetRoot);
                 SetPhase(L.T("Inventaire du dossier 1", "Listing folder 1"));
                 await ScanAsync(sourceSnapshot, true);
@@ -89,6 +97,7 @@ public sealed class ComparisonEngine
                 BuildInitialRows(sourceSnapshot, targetSnapshot);
                 PlanHashBytes(sourceSnapshot, targetSnapshot);
                 SetPhase(L.T("Vérification SHA-256 des fichiers correspondants", "Verifying matching files with SHA-256"));
+                await PrefetchPairsAsync(sourceSnapshot, targetSnapshot);
 
                 foreach (var item in sourceSnapshot.Entries.Values)
                 {
@@ -142,6 +151,7 @@ public sealed class ComparisonEngine
 
                 if (options.FindMovedFiles)
                     await FindMovedFilesAsync(sourceSnapshot, targetSnapshot);
+                MarkCaseDifferences(sourceSnapshot, targetSnapshot);
 
                 cancellationToken.ThrowIfCancellationRequested();
                 SetPhase(L.T("Contrôle final des modifications", "Final check for changes"));
@@ -151,7 +161,8 @@ public sealed class ComparisonEngine
                 await ScanAsync(finalTarget, false);
                 var sourceStable = VerifySnapshot(sourceSnapshot, finalSource, true);
                 var targetStable = VerifySnapshot(targetSnapshot, finalTarget, false);
-                snapshotVerified = sourceStable && targetStable && _errors.Count == 0;
+                var contentsStable = await VerifyReadIdentitiesAsync();
+                snapshotVerified = sourceStable && targetStable && contentsStable && _errors.Count == 0;
                 cancellationToken.ThrowIfCancellationRequested();
                 SetPhase(L.T("Comparaison terminée", "Comparison completed"));
             }
@@ -211,6 +222,34 @@ public sealed class ComparisonEngine
                 CheckpointPath = _checkpointPath,
                 Warnings = _warnings.ToArray()
             };
+        }
+
+        /// <summary>
+        /// Reads same-path pairs ahead of the verdict loop, as many at once as their devices allow. The loop then
+        /// finds every sample and digest already computed, so its decisions and their order do not change. With a
+        /// single reader nothing is gained and the loop reads in its usual order.
+        /// </summary>
+        private async Task PrefetchPairsAsync(Snapshot sourceSnapshot, Snapshot targetSnapshot)
+        {
+            if (_readers is not { Slots: > 1 } readers) return;
+            var pairs = sourceSnapshot.Entries.Values
+                .Select(item => (Source: item, Target: targetSnapshot.Entries.GetValueOrDefault(item.RelativePath)))
+                .Where(pair => Readable(pair.Source) && pair.Target is not null && Readable(pair.Target) && pair.Source.Size == pair.Target.Size)
+                .ToArray();
+            await Parallel.ForEachAsync(pairs, new ParallelOptions { MaxDegreeOfParallelism = readers.Slots, CancellationToken = cancellationToken }, async (pair, token) =>
+            {
+                var (item, other) = (pair.Source, pair.Target!);
+                bool known;
+                lock (_gate)
+                    known = _hashes.ContainsKey(item.FullPath) || _hashes.ContainsKey(other.FullPath) ||
+                        _checkpointFiles.ContainsKey(item.FullPath) || _checkpointFiles.ContainsKey(other.FullPath);
+                if (ShouldSample(item) && !known)
+                {
+                    var samples = await Task.WhenAll(readers.Run(item.FullPath, () => SampleAsync(item), token), readers.Run(other.FullPath, () => SampleAsync(other), token));
+                    if (samples[0] is null || samples[1] is null || samples[0] != samples[1]) return;
+                }
+                await Task.WhenAll(readers.Run(item.FullPath, () => HashAsync(item), token), readers.Run(other.FullPath, () => HashAsync(other), token));
+            });
         }
 
         private bool IsStrictlyContained(Snapshot snapshot) =>
@@ -280,10 +319,16 @@ public sealed class ComparisonEngine
                 _warnings.Add(L.T("La session enregistrée concerne d’autres dossiers ou options. Une nouvelle comparaison a été démarrée.", "The saved session uses different folders or options. A new comparison has been started."));
                 return;
             }
+            // A saved hash is trusted only where every write moves the file's change time (NTFS, ReFS): on FAT32 or
+            // exFAT an edit that restores its date would look unchanged, so those files are read again.
+            var sourceKeeps = FileSafety.KeepsChangeTime(sourceRoot);
+            var targetKeeps = FileSafety.KeepsChangeTime(targetRoot);
+            if (!sourceKeeps || !targetKeeps)
+                _warnings.Add(L.T("Un des disques ne tient pas de date de changement fiable (FAT32, exFAT…) : ses fichiers sont relus, sans réutiliser la vérification précédente.", "One of the drives keeps no reliable change time (FAT32, exFAT…): its files are read again rather than trusting the previous check."));
             foreach (var file in data.Files)
             {
-                if (!Path.IsPathFullyQualified(file.FullPath) ||
-                    (!IsWithin(sourceRoot, file.FullPath) && !IsWithin(targetRoot, file.FullPath))) continue;
+                if (!Path.IsPathFullyQualified(file.FullPath)) continue;
+                if (!(IsWithin(sourceRoot, file.FullPath) ? sourceKeeps : IsWithin(targetRoot, file.FullPath) && targetKeeps)) continue;
                 _checkpointFiles[file.FullPath] = file;
             }
             _hasCheckpoint = true;
@@ -291,6 +336,9 @@ public sealed class ComparisonEngine
 
         private void ValidateCheckpointPath(string path)
         {
+            // "folder:resume.json" is a hidden stream of the folder itself: writing it would change a compared root.
+            if (Path.GetFileName(path).Contains(':'))
+                throw new ArgumentException(L.T("Chemin de reprise invalide.", "Invalid resume path."), nameof(options.CheckpointPath));
             if (IsWithin(_sourceRoot, path) || IsWithin(_targetRoot, path))
                 throw new ArgumentException(L.T("Le fichier de reprise doit être enregistré hors des deux dossiers comparés.", "The resume file must be saved outside both compared folders."), nameof(options.CheckpointPath));
             var parent = Path.GetDirectoryName(path) ?? throw new ArgumentException(L.T("Chemin de reprise invalide.", "Invalid resume path."));
@@ -324,8 +372,23 @@ public sealed class ComparisonEngine
         private bool SaveCheckpoint(bool force = false)
         {
             if (_checkpointPath is null) return false;
-            if (!force && (!_checkpointDirty || (_hasCheckpoint && _checkpointTimer.ElapsedMilliseconds < 1000))) return false;
+            List<CheckpointFile> files;
+            lock (_gate)
+            {
+                // A reader finding another one saving skips its turn: the next save includes its file. Each save rewrites
+                // every hash, so a save waits until the hashes have grown by a quarter (at most five minutes of work
+                // lost in a crash), and at least twenty times its own duration: the bytes written stay a few times the
+                // final file instead of growing with the square of the file count. Stopping always saves at once.
+                var elapsed = _checkpointTimer.ElapsedMilliseconds;
+                var due = elapsed >= Math.Max(1000, 20 * _lastSaveMilliseconds) &&
+                    (_checkpointFiles.Count >= _savedEntries + Math.Max(1, _savedEntries / 4) || elapsed >= 300_000);
+                if (_saving || (!force && (!_checkpointDirty || (_hasCheckpoint && !due)))) return false;
+                _saving = true;
+                _checkpointDirty = false;
+                files = _checkpointFiles.Values.ToList();
+            }
             string? temporary = null;
+            var clock = Stopwatch.StartNew();
             try
             {
                 ValidateCheckpointPath(_checkpointPath);
@@ -334,7 +397,7 @@ public sealed class ComparisonEngine
                     SourceRoot = _sourceRoot, TargetRoot = _targetRoot,
                     SourceCanonicalRoot = _sourceCanonical, TargetCanonicalRoot = _targetCanonical,
                     FindMovedFiles = options.FindMovedFiles, SavedAt = DateTimeOffset.Now,
-                    Files = _checkpointFiles.Values.ToList()
+                    Files = files
                 };
                 temporary = Path.Combine(Path.GetDirectoryName(_checkpointPath)!, $".{Path.GetFileName(_checkpointPath)}.{Guid.NewGuid():N}.tmp");
                 using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
@@ -343,20 +406,35 @@ public sealed class ComparisonEngine
                     stream.Flush(true);
                 }
                 // Replace the directory entry, never truncate a possible pre-existing hard link.
-                File.Move(temporary, _checkpointPath, true);
+                // The antivirus may still hold the previous copy it is scanning: the save that ends a run, the one a
+                // resume relies on, tries again briefly rather than losing every hash computed since the last save.
+                for (var attempt = 1; ; attempt++)
+                {
+                    try { File.Move(temporary, _checkpointPath, true); break; }
+                    catch (Exception exception) when (force && attempt < 5 && exception is IOException or UnauthorizedAccessException) { Thread.Sleep(100 * attempt); }
+                }
                 temporary = null;
-                _hasCheckpoint = true;
-                _checkpointDirty = false;
-                _checkpointTimer.Restart();
+                lock (_gate)
+                {
+                    _hasCheckpoint = true;
+                    _lastSaveMilliseconds = clock.ElapsedMilliseconds;
+                    _savedEntries = files.Count;
+                    _checkpointTimer.Restart();
+                }
                 return true;
             }
             catch (Exception exception) when (IsFileSystemException(exception) || exception is ArgumentException or JsonException)
             {
-                _warnings.Add(L.F($"Enregistrement de la reprise impossible : {exception.Message}", $"Unable to save resume data: {exception.Message}"));
+                lock (_gate)
+                {
+                    _checkpointDirty = true;
+                    _warnings.Add(L.F($"Enregistrement de la reprise impossible : {exception.Message}", $"Unable to save resume data: {exception.Message}"));
+                }
                 return false;
             }
             finally
             {
+                lock (_gate) _saving = false;
                 if (temporary is not null)
                 {
                     try { File.Delete(temporary); }
@@ -372,9 +450,7 @@ public sealed class ComparisonEngine
             {
                 var root = await RetryIoAsync(() =>
                 {
-                    var rootInfo = new DirectoryInfo(snapshot.Root);
-                    rootInfo.Refresh();
-                    return (Entry: ReadEntry(rootInfo, "."), Canonical: CanonicalRoot(snapshot.Root));
+                    return (Entry: ReadEntry(snapshot.Root, "."), Canonical: CanonicalRoot(snapshot.Root));
                 }, snapshot.Root);
                 snapshot.RootEntry = root.Entry;
                 snapshot.CanonicalRoot = root.Canonical;
@@ -441,15 +517,16 @@ public sealed class ComparisonEngine
         {
             if (FileSafety.Access(directory, File.GetAttributes(directory)) == EntryAccess.Link) return null;
             var result = new List<Entry>();
+            // A larger listing buffer means fewer round trips per folder on network shares.
             var enumeration = new EnumerationOptions
             {
                 RecurseSubdirectories = false, IgnoreInaccessible = false,
-                AttributesToSkip = 0, ReturnSpecialDirectories = false
+                AttributesToSkip = 0, ReturnSpecialDirectories = false, BufferSize = 64 * 1024
             };
             foreach (var info in new DirectoryInfo(directory).EnumerateFileSystemInfos("*", enumeration))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var relative = Path.GetRelativePath(root, info.FullName);
+                var relative = FileSafety.RelativeTo(root, info.FullName);
                 try
                 {
                     result.Add(ReadEnumeratedEntry(info, relative));
@@ -486,15 +563,15 @@ public sealed class ComparisonEngine
             return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, null, access);
         }
 
-        private static Entry ReadEntry(FileSystemInfo info, string relative)
+        private static Entry ReadEntry(string fullPath, string relative)
         {
             // Exists suppresses network errors, which would turn a transient disconnection
-            // into a misleading 'missing file'. GetAttributes preserves the native error.
-            var attributes = File.GetAttributes(info.FullName);
-            var kind = (attributes & FileAttributes.Directory) != 0 ? EntryKind.Directory : EntryKind.File;
-            var access = FileSafety.Access(info.FullName, attributes);
-            long? size = kind == EntryKind.File && access != EntryAccess.Link ? new FileInfo(info.FullName).Length : null;
-            return new Entry(relative, info.FullName, kind, size, info.LastWriteTimeUtc, info.CreationTimeUtc, attributes, null, access);
+            // into a misleading 'missing file'. The native query preserves the error code.
+            var metadata = FileSafety.Stat(fullPath);
+            var kind = (metadata.Attributes & FileAttributes.Directory) != 0 ? EntryKind.Directory : EntryKind.File;
+            var access = FileSafety.Access(fullPath, metadata.Attributes);
+            long? size = kind == EntryKind.File && access != EntryAccess.Link ? metadata.Size : null;
+            return new Entry(relative, fullPath, kind, size, metadata.LastWriteUtc, metadata.CreationUtc, metadata.Attributes, null, access);
         }
 
         private void MarkDirectoryProblem(Snapshot snapshot, string fullPath, string reason)
@@ -574,6 +651,10 @@ public sealed class ComparisonEngine
                     detail = L.T("Fichier disponible uniquement en ligne (OneDrive ou autre service) : non téléchargé, contenu non vérifié. Même taille", "Online-only file (OneDrive or another service): not downloaded, contents not verified. Same size")
                         + (first.LastWriteUtc == second.LastWriteUtc ? L.T(" et même date de modification.", " and modification date.") : L.T(", date de modification différente.", ", different modification date."));
                 }
+                // Still a real file, reported as such, but a copy never carries it over to the other folder.
+                if (status is ComparisonStatus.OnlySource or ComparisonStatus.OnlyTarget && (first ?? second)!.Kind == EntryKind.File &&
+                    CopyEngine.IsCopyTemporary(Path.GetFileName(relative)))
+                    detail += L.T(" Fichier temporaire d’une copie Checker San interrompue : il n’est jamais recopié.", " Temporary file of an interrupted Checker San copy: it is never copied over.");
                 _rows[relative] = new ComparisonRow
                 {
                     Kind = first?.Kind ?? second!.Kind,
@@ -760,38 +841,42 @@ public sealed class ComparisonEngine
 
         private async Task<string?> SampleAsync(Entry entry)
         {
-            if (_samples.TryGetValue(entry.FullPath, out var cached)) return cached;
-            try { return await RetryOperationAsync(() => ReadSampleAsync(entry), entry.FullPath); }
+            lock (_gate)
+                if (_samples.TryGetValue(entry.FullPath, out var cached)) return cached;
+            try { return await RetryIoAsync(() => ReadSample(entry), entry.FullPath); }
             catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
                 var reason = L.F($"Impossible de présélectionner « {entry.FullPath} » : {exception.Message}", $"Unable to filter candidate ‘{entry.FullPath}’: {exception.Message}");
-                _errors.Add(reason);
-                _samples[entry.FullPath] = null;
-                _checkpointFiles.Remove(entry.FullPath);
+                lock (_gate)
+                {
+                    _errors.Add(reason);
+                    _samples[entry.FullPath] = null;
+                    _checkpointFiles.Remove(entry.FullPath);
+                }
                 MarkUnverified(entry, reason);
                 return null;
             }
         }
 
-        private async Task<string> ReadSampleAsync(Entry entry)
+        // Synchronous reads on this worker thread: on an NVMe drive, asynchronous FileStream reads hashed
+        // about 600 MiB/s against 1.2 to 1.4 GiB/s synchronously, as cached read-ahead overlaps the hashing.
+        private string ReadSample(Entry entry)
         {
             cancellationToken.ThrowIfCancellationRequested();
             _currentPath = entry.FullPath;
             ReportProgress(true);
-            var before = new FileInfo(entry.FullPath);
-            before.Refresh();
-            if (!SameMetadata(entry, ReadEntry(before, entry.RelativePath)))
+            if (!SameMetadata(entry, ReadEntry(entry.FullPath, entry.RelativePath)))
                 throw new IOException(L.T("Le fichier a changé depuis l’inventaire.", "The file has changed since it was listed."));
 
             // No content verdict can be positive from these samples. They only reject
             // candidates; equal signatures always proceed to a complete SHA-256 read.
             // Disable FileStream buffering so each seek reads exactly its small block.
-            await using var stream = new FileStream(entry.FullPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                1, FileOptions.Asynchronous | FileOptions.RandomAccess);
-            if (stream.Length != entry.Size || File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
-                File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
+            using var stream = new FileStream(FileSafety.Native(entry.FullPath), FileMode.Open, FileAccess.Read, FileShare.Read,
+                1, FileOptions.RandomAccess);
+            var opened = FileSafety.Describe(stream.SafeFileHandle);
+            if (stream.Length != entry.Size || opened.LastWriteUtc != entry.LastWriteUtc || opened.CreationUtc != entry.CreationUtc)
                 throw new IOException(L.T("Les métadonnées du fichier ouvert ont changé depuis l’inventaire.", "The opened file's metadata has changed since it was listed."));
-            var identity = FileSafety.Identity(stream.SafeFileHandle);
+            var identity = opened.Identity;
             var buffer = ArrayPool<byte>.Shared.Rent(SampleBlockSize);
             try
             {
@@ -803,25 +888,24 @@ public sealed class ComparisonEngine
                     var total = 0;
                     while (total < SampleBlockSize)
                     {
-                        var read = await stream.ReadAsync(buffer.AsMemory(total, SampleBlockSize - total), cancellationToken);
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var read = stream.Read(buffer, total, SampleBlockSize - total);
                         if (read == 0) throw new IOException(L.T("Lecture incomplète pendant la présélection.", "Incomplete read during candidate filtering."));
                         total += read;
-                        _sampleBytesRead += read;
+                        Interlocked.Add(ref _sampleBytesRead, read);
                         ReportProgress();
                     }
                     hasher.AppendData(buffer, 0, total);
                 }
                 cancellationToken.ThrowIfCancellationRequested();
-                if (stream.Length != entry.Size || File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
-                    File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
+                var closing = FileSafety.Describe(stream.SafeFileHandle);
+                if (stream.Length != entry.Size || closing.LastWriteUtc != entry.LastWriteUtc || closing.CreationUtc != entry.CreationUtc)
                     throw new IOException(L.T("Le fichier a changé pendant la présélection.", "The file changed during candidate filtering."));
-                var after = new FileInfo(entry.FullPath);
-                after.Refresh();
-                if (!SameMetadata(entry, ReadEntry(after, entry.RelativePath)) ||
-                    (identity is not null && identity != FileSafety.Identity(stream.SafeFileHandle)))
+                if (!SameMetadata(entry, ReadEntry(entry.FullPath, entry.RelativePath)) ||
+                    (identity is not null && identity != closing.Identity))
                     throw new IOException(L.T("L’identité ou les métadonnées du fichier ont changé pendant la présélection.", "The file's identity or metadata changed during candidate filtering."));
                 var signature = Convert.ToHexString(hasher.GetHashAndReset());
-                _samples[entry.FullPath] = signature;
+                lock (_gate) _samples[entry.FullPath] = signature;
                 return signature;
             }
             finally { ArrayPool<byte>.Shared.Return(buffer); }
@@ -829,78 +913,84 @@ public sealed class ComparisonEngine
 
         private async Task<string?> HashAsync(Entry entry)
         {
-            try { return await RetryOperationAsync(() => ReadHashAsync(entry), entry.FullPath); }
+            try { return await RetryIoAsync(() => ReadHash(entry), entry.FullPath); }
             catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
             {
                 var reason = L.F($"Impossible de vérifier « {entry.FullPath} » : {exception.Message}", $"Unable to verify ‘{entry.FullPath}’: {exception.Message}");
-                _errors.Add(reason); _hashes[entry.FullPath] = null; _checkpointFiles.Remove(entry.FullPath);
+                lock (_gate) { _errors.Add(reason); _hashes[entry.FullPath] = null; _checkpointFiles.Remove(entry.FullPath); }
                 MarkUnverified(entry, reason);
                 return null;
             }
         }
 
-        private async Task<string?> ReadHashAsync(Entry entry)
+        private string? ReadHash(Entry entry)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (_hashes.TryGetValue(entry.FullPath, out var cached)) return cached;
+            lock (_gate)
+                if (_hashes.TryGetValue(entry.FullPath, out var cached)) return cached;
             _currentPath = entry.FullPath;
             ReportProgress(true);
             byte[]? buffer = null;
             try
             {
-                var before = new FileInfo(entry.FullPath);
-                before.Refresh();
-                if (!SameMetadata(entry, ReadEntry(before, entry.RelativePath)))
+                if (!SameMetadata(entry, ReadEntry(entry.FullPath, entry.RelativePath)))
                     throw new IOException(L.T("Le fichier a changé depuis l’inventaire.", "The file has changed since it was listed."));
 
                 // Deny concurrent write/delete handles while bytes are read. An existing
                 // incompatible writer causes a reported sharing violation, never a verdict.
-                await using var stream = new FileStream(entry.FullPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                    1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                if (stream.Length != entry.Size || File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
-                    File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
+                using var stream = new FileStream(FileSafety.Native(entry.FullPath), FileMode.Open, FileAccess.Read, FileShare.Read,
+                    1024 * 1024, FileOptions.SequentialScan);
+                var opened = FileSafety.Describe(stream.SafeFileHandle);
+                if (stream.Length != entry.Size || opened.LastWriteUtc != entry.LastWriteUtc || opened.CreationUtc != entry.CreationUtc)
                     throw new IOException(L.T("Les métadonnées du fichier ouvert ont changé depuis l’inventaire.", "The opened file's metadata has changed since it was listed."));
 
-                var identity = FileSafety.Identity(stream.SafeFileHandle);
-                if (_checkpointFiles.TryGetValue(entry.FullPath, out var saved) && identity is not null && saved.Identity == identity &&
-                    saved.Size == entry.Size && saved.LastWriteUtc == entry.LastWriteUtc && saved.CreationUtc == entry.CreationUtc && saved.Attributes == entry.Attributes)
+                var identity = opened.Identity;
+                lock (_gate)
                 {
-                    _hashes[entry.FullPath] = saved.Hash;
-                    _filesReused++;
-                    _totalHashBytes = Math.Max(0, _totalHashBytes - (entry.Size ?? 0));
-                    ReportProgress(true);
-                    return saved.Hash;
+                    if (_checkpointFiles.TryGetValue(entry.FullPath, out var saved) && identity is not null && saved.Identity == identity &&
+                        saved.Size == entry.Size && saved.LastWriteUtc == entry.LastWriteUtc && saved.CreationUtc == entry.CreationUtc && saved.Attributes == entry.Attributes)
+                    {
+                        _hashes[entry.FullPath] = saved.Hash;
+                        _readIdentities[entry.FullPath] = (entry, identity);
+                        _filesReused++;
+                        _totalHashBytes = Math.Max(0, _totalHashBytes - (entry.Size ?? 0));
+                        ReportProgress(true);
+                        return saved.Hash;
+                    }
+                    _checkpointFiles.Remove(entry.FullPath);
                 }
-                _checkpointFiles.Remove(entry.FullPath);
 
                 using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                 buffer = ArrayPool<byte>.Shared.Rent(1024 * 1024);
                 long readForFile = 0;
                 int read;
-                while ((read = await stream.ReadAsync(buffer.AsMemory(), cancellationToken)) != 0)
+                while ((read = stream.Read(buffer, 0, buffer.Length)) != 0)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     hasher.AppendData(buffer, 0, read);
                     readForFile += read;
-                    _bytesHashed += read;
+                    Interlocked.Add(ref _bytesHashed, read);
                     ReportProgress();
                 }
                 cancellationToken.ThrowIfCancellationRequested();
+                var closing = FileSafety.Describe(stream.SafeFileHandle);
                 if (readForFile != entry.Size || stream.Length != entry.Size ||
-                    File.GetLastWriteTimeUtc(stream.SafeFileHandle) != entry.LastWriteUtc ||
-                    File.GetCreationTimeUtc(stream.SafeFileHandle) != entry.CreationUtc)
+                    closing.LastWriteUtc != entry.LastWriteUtc || closing.CreationUtc != entry.CreationUtc)
                     throw new IOException(L.T("Le fichier a changé pendant le calcul SHA-256.", "The file changed during SHA-256 hashing."));
-                var after = new FileInfo(entry.FullPath);
-                after.Refresh();
-                if (!SameMetadata(entry, ReadEntry(after, entry.RelativePath)))
+                if (!SameMetadata(entry, ReadEntry(entry.FullPath, entry.RelativePath)))
                     throw new IOException(L.T("Le chemin ou les métadonnées du fichier ont changé pendant sa lecture.", "The file's path or metadata changed while it was being read."));
-                if (identity is not null && identity != FileSafety.Identity(stream.SafeFileHandle))
+                if (identity is not null && identity != closing.Identity)
                     throw new IOException(L.T("L’identité ou la date de changement du fichier a changé pendant sa lecture.", "The file's identity or change time changed while it was being read."));
 
                 var hash = Convert.ToHexString(hasher.GetHashAndReset());
-                _hashes[entry.FullPath] = hash;
-                _filesHashed++;
-                _checkpointFiles[entry.FullPath] = new CheckpointFile { FullPath = entry.FullPath, Size = entry.Size!.Value, LastWriteUtc = entry.LastWriteUtc, CreationUtc = entry.CreationUtc, Attributes = entry.Attributes, Hash = hash, Identity = identity };
-                _checkpointDirty = true;
+                lock (_gate)
+                {
+                    _hashes[entry.FullPath] = hash;
+                    if (closing.Identity is not null) _readIdentities[entry.FullPath] = (entry, closing.Identity);
+                    _filesHashed++;
+                    _checkpointFiles[entry.FullPath] = new CheckpointFile { FullPath = entry.FullPath, Size = entry.Size!.Value, LastWriteUtc = entry.LastWriteUtc, CreationUtc = entry.CreationUtc, Attributes = entry.Attributes, Hash = hash, Identity = identity };
+                    _checkpointDirty = true;
+                }
                 SaveCheckpoint();
                 ReportProgress(true);
                 return hash;
@@ -909,6 +999,57 @@ public sealed class ComparisonEngine
             {
                 if (buffer is not null) ArrayPool<byte>.Shared.Return(buffer);
             }
+        }
+
+        /// <summary>
+        /// The last listing compares directory entries, which miss an in-place write that keeps size and date,
+        /// or any write through another hard link. Each file behind an Identical or Moved row is therefore
+        /// queried by handle: a new change time or identity means its hash no longer proves anything.
+        /// </summary>
+        /// <summary>
+        /// Paths are paired ignoring case, as Windows does. Where the two names differ by case the row says so, and in
+        /// a case-sensitive folder (WSL, per-folder setting) they are two different names, never identical.
+        /// </summary>
+        private void MarkCaseDifferences(Snapshot source, Snapshot target)
+        {
+            foreach (var (relative, first) in source.Entries)
+            {
+                if (!target.Entries.TryGetValue(relative, out var second) || string.Equals(first.RelativePath, second.RelativePath, StringComparison.Ordinal) ||
+                    !_rows.TryGetValue(relative, out var row)) continue;
+                var note = L.F($" Noms écrits avec une casse différente : « {first.RelativePath} » et « {second.RelativePath} ».", $" Names written with a different case: ‘{first.RelativePath}’ and ‘{second.RelativePath}’.");
+                var sensitive = FileSafety.CaseSensitive(Path.GetDirectoryName(first.FullPath)!) || FileSafety.CaseSensitive(Path.GetDirectoryName(second.FullPath)!);
+                _rows[relative] = sensitive
+                    ? row with { Status = ComparisonStatus.Conflict, Detail = L.T("Dossier sensible à la casse : ce ne sont pas les mêmes noms.", "Case-sensitive folder: these are not the same names.") + note }
+                    : row with { Detail = row.Detail + note };
+            }
+        }
+
+        private async Task<bool> VerifyReadIdentitiesAsync()
+        {
+            List<(string Path, Entry Entry, FileIdentity Identity)> proven;
+            lock (_gate)
+                proven = _rows.Values.Where(row => row.Status is ComparisonStatus.Identical or ComparisonStatus.Moved)
+                    .SelectMany(row => new[] { row.SourcePath, row.TargetPath }).OfType<string>()
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Where(_readIdentities.ContainsKey)
+                    .Select(path => (path, _readIdentities[path].Entry, _readIdentities[path].Identity)).ToList();
+            static FileIdentity? Query(string path)
+            {
+                try { return FileSafety.CurrentIdentity(path); }
+                catch (Exception exception) when (IsFileSystemException(exception)) { return null; }
+            }
+            // About 70 µs per file on NVMe: queried with the same per-disk readers as the hashes.
+            var changed = 0;
+            await Parallel.ForEachAsync(proven, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _readers?.Slots ?? 1), CancellationToken = cancellationToken }, async (item, token) =>
+            {
+                var now = _readers is { } readers ? await readers.Run(item.Path, () => Task.FromResult(Query(item.Path)), token) : Query(item.Path);
+                if (now == item.Identity) return;
+                Interlocked.Increment(ref changed);
+                var problem = L.F($"Fichier modifié pendant la comparaison, après sa lecture : « {item.Path} ». Relancez l’analyse.", $"File changed during the comparison, after it was read: ‘{item.Path}’. Scan again.");
+                lock (_gate) _errors.Add(problem);
+                MarkUnverified(item.Entry, problem);
+            });
+            return changed == 0;
         }
 
         private bool VerifySnapshot(Snapshot original, Snapshot final, bool isSource)
@@ -967,12 +1108,13 @@ public sealed class ComparisonEngine
 
         private void MarkUnverified(Entry entry, string reason)
         {
-            foreach (var pair in _rows.ToArray())
-            {
-                if (string.Equals(pair.Value.SourcePath, entry.FullPath, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(pair.Value.TargetPath, entry.FullPath, StringComparison.OrdinalIgnoreCase))
-                    _rows[pair.Key] = pair.Value with { Status = ComparisonStatus.Unverified, Detail = reason };
-            }
+            lock (_gate)
+                foreach (var pair in _rows.ToArray())
+                {
+                    if (string.Equals(pair.Value.SourcePath, entry.FullPath, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(pair.Value.TargetPath, entry.FullPath, StringComparison.OrdinalIgnoreCase))
+                        _rows[pair.Key] = pair.Value with { Status = ComparisonStatus.Unverified, Detail = reason };
+                }
         }
 
         private void SetPhase(string phase)
@@ -984,20 +1126,24 @@ public sealed class ComparisonEngine
 
         private void ReportProgress(bool force = false)
         {
-            if (progress is null || (!force && _progressTimer.ElapsedMilliseconds < 80)) return;
-            _progressTimer.Restart();
-            progress.Report(new ComparisonProgress
+            if (progress is null) return;
+            lock (_gate)
             {
-                Phase = _phase,
-                CurrentPath = _currentPath,
-                FilesDiscovered = _filesDiscovered,
-                FilesHashed = _filesHashed,
-                BytesHashed = _bytesHashed,
-                SampleBytesRead = _sampleBytesRead,
-                TotalHashBytes = _totalHashBytes,
-                FilesReused = _filesReused,
-                RetryAttempt = _retryAttempt
-            });
+                if (!force && _progressTimer.ElapsedMilliseconds < 80) return;
+                _progressTimer.Restart();
+                progress.Report(new ComparisonProgress
+                {
+                    Phase = _phase,
+                    CurrentPath = _currentPath,
+                    FilesDiscovered = _filesDiscovered,
+                    FilesHashed = _filesHashed,
+                    BytesHashed = Interlocked.Read(ref _bytesHashed),
+                    SampleBytesRead = Interlocked.Read(ref _sampleBytesRead),
+                    TotalHashBytes = _totalHashBytes,
+                    FilesReused = _filesReused,
+                    RetryAttempt = _retryAttempt
+                });
+            }
         }
     }
 
@@ -1048,12 +1194,36 @@ public sealed class ComparisonEngine
     {
         try
         {
-            if (RelatedRoots(sourceRoot, targetRoot) || RelatedRoots(CanonicalRoot(sourceRoot), CanonicalRoot(targetRoot)))
+            if (RelatedRoots(sourceRoot, targetRoot) || RelatedRoots(CanonicalRoot(sourceRoot), CanonicalRoot(targetRoot)) ||
+                RelatedByIdentity(sourceRoot, targetRoot))
                 throw new ArgumentException(L.T("Choisissez deux dossiers distincts : aucun ne doit être contenu dans l’autre.", "Choose two separate folders: neither may be inside the other."));
         }
         catch (Exception exception) when (IsFileSystemException(exception) && !FileSystemRetryPolicy.IsTransient(exception))
         {
             throw new ArgumentException(L.F($"Impossible de confirmer les chemins réels des dossiers : {exception.Message}", $"Unable to confirm the physical folder paths: {exception.Message}"), exception);
+        }
+    }
+
+    /// <summary>
+    /// Canonical paths keep the server name, so \\NAS\Photos and \\192.168.1.10\Photos look unrelated. The
+    /// same folder, or one inside the other, is recognized by its volume and file identifier instead.
+    /// </summary>
+    private static bool RelatedByIdentity(string first, string second)
+    {
+        var a = FileSafety.ObjectId(first);
+        var b = FileSafety.ObjectId(second);
+        if (a is null || b is null) return false;
+        return a == b || HasAncestor(first, b.Value) || HasAncestor(second, a.Value);
+
+        static bool HasAncestor(string path, (ulong, ulong, ulong) id)
+        {
+            for (var parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(path)); parent is not null; parent = Path.GetDirectoryName(parent))
+            {
+                // An ancestor without list rights, such as a share root, ends the walk: nothing above it is compared.
+                try { if (FileSafety.ObjectId(parent) == id) return true; }
+                catch (Win32Exception) { return false; }
+            }
+            return false;
         }
     }
 
@@ -1069,7 +1239,7 @@ public sealed class ComparisonEngine
     private static string CanonicalRoot(string path)
     {
         if (!OperatingSystem.IsWindows()) return Path.GetFullPath(path);
-        using var handle = CreateFileW(path, 0x80, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        using var handle = CreateFileW(FileSafety.Native(path), 0x80, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
         if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
         var buffer = new StringBuilder(512);
         var length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
