@@ -14,21 +14,7 @@ public static class ReportWriter
 {
     public static void Write(string path, ComparisonResult result)
     {
-        path = Path.GetFullPath(path);
-        var parent = CanonicalDirectory(Path.GetDirectoryName(path)!);
-        foreach (var root in new[] { result.SourceRoot, result.TargetRoot })
-        {
-            var canonicalRoot = CanonicalDirectory(root);
-            if (string.Equals(parent, canonicalRoot, StringComparison.OrdinalIgnoreCase) ||
-                parent.StartsWith(Path.EndsInDirectorySeparator(canonicalRoot) ? canonicalRoot : canonicalRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-                throw new IOException(L.T("Enregistrez le rapport à l’extérieur des deux dossiers comparés, y compris leurs liens et jonctions.",
-                    "Save the report outside both compared folders, including their links and junctions."));
-        }
-        if (File.Exists(path) || Directory.Exists(path))
-            throw new IOException(L.T("Choisissez un nouveau nom pour le rapport : aucun fichier existant n’est remplacé.",
-                "Choose a new report name: existing files are never replaced."));
-        // CreateNew also rejects existing symlinks/hardlinks, even if they appear after validation.
-        using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        using var output = CreateOutside(path, [result.SourceRoot, result.TargetRoot]);
         if (Path.GetExtension(path).Equals(".json", StringComparison.OrdinalIgnoreCase))
         {
             var options = new JsonSerializerOptions { WriteIndented = true };
@@ -69,6 +55,28 @@ public static class ReportWriter
         foreach (var warning in result.Warnings)
             WriteLine(writer, new[] { L.T("Avertissement", "Warning"), "", "", "", "", "", "", "", "", warning }.Concat(meta));
     }
+    /// <summary>
+    /// Creates a new report outside every scanned root, including through links and junctions, so that saving
+    /// it never changes a scanned tree. Existing files are never replaced.
+    /// </summary>
+    internal static FileStream CreateOutside(string path, IEnumerable<string> roots)
+    {
+        path = Path.GetFullPath(path);
+        var parent = CanonicalDirectory(Path.GetDirectoryName(path)!);
+        foreach (var root in roots)
+        {
+            var canonicalRoot = CanonicalDirectory(root);
+            if (string.Equals(parent, canonicalRoot, StringComparison.OrdinalIgnoreCase) ||
+                parent.StartsWith(Path.EndsInDirectorySeparator(canonicalRoot) ? canonicalRoot : canonicalRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                throw new IOException(L.T("Enregistrez le rapport à l’extérieur des dossiers analysés, y compris leurs liens et jonctions.",
+                    "Save the report outside the scanned folders, including their links and junctions."));
+        }
+        if (File.Exists(path) || Directory.Exists(path))
+            throw new IOException(L.T("Choisissez un nouveau nom pour le rapport : aucun fichier existant n’est remplacé.",
+                "Choose a new report name: existing files are never replaced."));
+        // CreateNew also rejects existing symlinks/hardlinks, even if they appear after validation.
+        return new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+    }
     private static string YesNo(bool value) => value ? L.T("Oui", "Yes") : L.T("Non", "No");
     private static string CanonicalDirectory(string path)
     {
@@ -82,11 +90,5 @@ public static class ReportWriter
     private static extern SafeFileHandle CreateFileW(string fileName, uint access, FileShare share, IntPtr security, uint disposition, uint flags, IntPtr template);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern uint GetFinalPathNameByHandleW(SafeFileHandle file, StringBuilder path, uint capacity, uint flags);
-    private static void WriteLine(TextWriter writer, IEnumerable<string> fields) => writer.WriteLine(string.Join(";", fields.Select(Escape)));
-    private static string Escape(string field)
-    {
-        // Prevent spreadsheet formula execution from an untrusted filename. JSON retains exact text.
-        if (field.Length > 0 && "=+-@\t\r\n".Contains(field[0])) field = "'" + field;
-        return "\"" + field.Replace("\"", "\"\"") + "\"";
-    }
+    private static void WriteLine(TextWriter writer, IEnumerable<string> fields) => writer.WriteLine(Csv.Line(fields));
 }

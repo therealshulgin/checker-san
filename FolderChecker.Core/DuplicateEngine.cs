@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO.Enumeration;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -54,6 +55,10 @@ public sealed class DuplicateEngine
         return (int)information.NumberOfLinks;
     }
 
+    internal static bool? DeletePending(SafeFileHandle handle) =>
+        OperatingSystem.IsWindows() && GetFileInformationByHandleEx(handle, 1, out StandardInfo information, (uint)Marshal.SizeOf<StandardInfo>())
+            ? information.DeletePending != 0 : null;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct StandardInfo
     {
@@ -83,7 +88,7 @@ public sealed class DuplicateEngine
         public List<CacheEntry> Files { get; init; } = [];
     }
 
-    private sealed record InventoryItem(DuplicateFile File, bool Directory, EntryAccess Access);
+    private sealed record InventoryItem(DuplicateFile File, bool Directory, EntryAccess Access, bool Filtered);
 
     private sealed class Run(string requestedRoot, DuplicateScanOptions options,
         IProgress<DuplicateProgress>? progress, CancellationToken cancellationToken)
@@ -99,7 +104,7 @@ public sealed class DuplicateEngine
         private readonly Stopwatch _saveTimer = Stopwatch.StartNew();
         private string _root = "", _canonicalRoot = "", _phase = L.T("Préparation", "Preparing"), _currentPath = "";
         private string? _checkpoint;
-        private long _bytesRead, _filesScanned;
+        private long _bytesRead, _filesScanned, _filesFiltered;
         private int _retryAttempt;
         private bool _checkpointDirty;
 
@@ -127,7 +132,8 @@ public sealed class DuplicateEngine
                 var onlineOnly = initial.Values.Count(item => item.Access == EntryAccess.OnlineOnly);
                 if (onlineOnly > 0)
                     _warnings.Add(L.F($"{onlineOnly:N0} fichier(s) disponible(s) uniquement en ligne n’ont pas été analysés, pour ne pas les télécharger.", $"{onlineOnly:N0} online-only file(s) were not scanned, to avoid downloading them."));
-                foreach (var sizeGroup in initial.Values.Where(item => !item.Directory && item.Access == EntryAccess.Normal)
+                _filesFiltered += initial.Values.Count(item => !item.Directory && item.Access == EntryAccess.Normal && item.File.Size < options.MinimumSize);
+                foreach (var sizeGroup in initial.Values.Where(item => !item.Directory && item.Access == EntryAccess.Normal && item.File.Size >= options.MinimumSize)
                              .GroupBy(item => item.File.Size).Where(group => group.Count() > 1))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -218,7 +224,7 @@ public sealed class DuplicateEngine
                 Groups = _groups.OrderByDescending(group => group.Size * (group.Files.Count - 1))
                     .ThenBy(group => group.Files[0].RelativePath, StringComparer.OrdinalIgnoreCase).ToArray(),
                 Errors = _errors.ToArray(), Warnings = _warnings.ToArray(), Cancelled = cancelled,
-                SnapshotVerified = verified && !cancelled, FilesScanned = _filesScanned,
+                SnapshotVerified = verified && !cancelled, FilesScanned = _filesScanned, FilesFiltered = _filesFiltered,
                 FilesHashed = _fullyHashed.Count, BytesRead = _bytesRead, FilesReused = _reused.Count,
                 CheckpointSaved = checkpointSaved
             };
@@ -275,7 +281,7 @@ public sealed class DuplicateEngine
                                 Size = isDirectory || access == EntryAccess.Link ? 0 : ((FileInfo)entry).Length,
                                 LastWriteUtc = entry.LastWriteTimeUtc, CreationUtc = entry.CreationTimeUtc, Attributes = attributes
                             };
-                            items.Add(new InventoryItem(file, isDirectory, access));
+                            items.Add(new InventoryItem(file, isDirectory, access, Filtered(entry.Name, attributes)));
                         }
                         return items;
                     }, directory);
@@ -287,6 +293,12 @@ public sealed class DuplicateEngine
                 }
                 foreach (var item in batch)
                 {
+                    // Filtered entries are not listed at all, so changes inside them cannot block the final check.
+                    if (item.Filtered)
+                    {
+                        if (count && !item.Directory) _filesFiltered++;
+                        continue;
+                    }
                     if (!entries.TryAdd(item.File.RelativePath, item))
                     {
                         _errors.Add(L.F($"Chemins ambigus, seule la casse diffère : {item.File.RelativePath}", $"Ambiguous paths differing only by case: {item.File.RelativePath}"));
@@ -568,6 +580,11 @@ public sealed class DuplicateEngine
             }
             finally { _retryAttempt = 0; _phase = previousPhase; }
         }
+
+        private bool Filtered(string name, FileAttributes attributes) =>
+            (options.SkipHiddenAndSystem && (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0) ||
+            options.ExcludedNames.Any(pattern => !string.IsNullOrWhiteSpace(pattern) &&
+                FileSystemName.MatchesSimpleExpression(pattern.Trim(), name, ignoreCase: true));
 
         private static bool SameMetadata(DuplicateFile left, DuplicateFile right) =>
             left.Size == right.Size && left.LastWriteUtc == right.LastWriteUtc

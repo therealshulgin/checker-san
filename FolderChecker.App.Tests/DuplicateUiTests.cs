@@ -45,7 +45,7 @@ internal static partial class Program
         {
             Check(DuplicateUiRows(window).All(row => !row.IsSelected), "nothing is selected automatically");
             Check(!DupControl<Button>(window, "RemoveButton").IsEnabled, "cannot remove with no selection");
-            Equal(0, DupControl<ComboBox>(window, "RemovalModeBox").SelectedIndex, "reversible quarantine is default");
+            Equal("RecycleBin", (DupControl<ComboBox>(window, "RemovalModeBox").SelectedItem as ComboBoxItem)?.Tag, "the reversible Recycle Bin is the default on a local drive");
             Check(DupControl<Button>(window, "SelectExtrasButton").IsEnabled, "explicit selection is available");
         }
         finally { window.Close(); }

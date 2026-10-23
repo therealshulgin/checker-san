@@ -6,6 +6,15 @@ public sealed record DuplicateScanOptions
     public bool ResumeFromCheckpoint { get; init; } = true;
     public int MaxRetries { get; init; } = 3;
     public int InitialRetryDelayMs { get; init; } = 1000;
+    /// <summary>Smaller files are never grouped. 1 leaves out empty files, whose removal often breaks software.</summary>
+    public long MinimumSize { get; init; }
+    /// <summary>Wildcard patterns (* and ?) matched against file and folder names; a matching folder is not scanned.</summary>
+    public IReadOnlyList<string> ExcludedNames { get; init; } = [];
+    /// <summary>Leaves out hidden or system files and folders, which Windows and applications maintain.</summary>
+    public bool SkipHiddenAndSystem { get; init; }
+
+    /// <summary>Metadata files that Windows and macOS create in many folders.</summary>
+    public static IReadOnlyList<string> DefaultExcludedNames { get; } = ["Thumbs.db", "desktop.ini", ".DS_Store"];
 }
 
 public sealed record DuplicateProgress
@@ -48,6 +57,8 @@ public sealed record DuplicateResult
     public bool Cancelled { get; init; }
     public bool SnapshotVerified { get; init; }
     public long FilesScanned { get; init; }
+    /// <summary>Files left out by the size, name or attribute filters (files inside excluded folders are not counted).</summary>
+    public long FilesFiltered { get; init; }
     public long FilesHashed { get; init; }
     public long BytesRead { get; init; }
     public long FilesReused { get; init; }

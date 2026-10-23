@@ -4,7 +4,7 @@ Windows 11 app that checks whether two folders contain the same files, and finds
 
 - **Compare** two folders in both directions: identical, missing, changed and moved files, confirmed by full SHA-256. Export to CSV or JSON.
 - **Complete** either folder with its missing files. Nothing is overwritten or deleted.
-- **Find duplicates**, then move the copies you choose to a quarantine folder or delete them.
+- **Find duplicates** with size and name filters, pick copies by hand or by rule, then send them to the Recycle Bin or a restorable quarantine, or delete them. Every action is journaled.
 - Stop and resume scans and copies at any time.
 
 ## Build

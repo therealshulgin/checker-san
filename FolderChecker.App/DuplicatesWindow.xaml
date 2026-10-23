@@ -13,6 +13,18 @@
             <Button x:Name="BrowseButton" Grid.Column="1" Content="{DynamicResource Dup_Browse}" Click="Browse_Click" Margin="8,0,0,0"/>
           </Grid>
           <CheckBox x:Name="ReuseCheck" IsChecked="True" Margin="0,10,0,0" ToolTip="{DynamicResource Dup_ReuseHint}"><TextBlock Text="{DynamicResource Dup_Reuse}" TextWrapping="Wrap"/></CheckBox>
+          <Expander x:Name="FiltersExpander" Header="{DynamicResource Dup_Filters}" Foreground="{StaticResource Muted}" Margin="0,10,0,0">
+            <Grid Margin="0,10,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+              <TextBlock Text="{DynamicResource Dup_MinSizeLabel}" VerticalAlignment="Center" Margin="0,0,12,0"/>
+              <ComboBox x:Name="MinSizeBox" Grid.Column="1" SelectedIndex="1" Height="36" MaxWidth="320" HorizontalAlignment="Left" MinWidth="260" AutomationProperties.Name="{DynamicResource Dup_MinSizeLabel}">
+                <ComboBoxItem Tag="0" Content="{DynamicResource Dup_MinSizeAll}"/><ComboBoxItem Tag="1" Content="{DynamicResource Dup_MinSizeNonEmpty}"/><ComboBoxItem Tag="1024" Content="{DynamicResource Dup_MinSize1K}"/><ComboBoxItem Tag="102400" Content="{DynamicResource Dup_MinSize100K}"/><ComboBoxItem Tag="1048576" Content="{DynamicResource Dup_MinSize1M}"/><ComboBoxItem Tag="104857600" Content="{DynamicResource Dup_MinSize100M}"/>
+              </ComboBox>
+              <TextBlock Grid.Row="1" Text="{DynamicResource Dup_ExcludeLabel}" VerticalAlignment="Center" Margin="0,8,12,0"/>
+              <TextBox x:Name="ExcludeBox" Grid.Row="1" Grid.Column="1" Margin="0,8,0,0" AutomationProperties.Name="{DynamicResource Dup_ExcludeLabel}"/>
+              <CheckBox x:Name="HiddenCheck" Grid.Row="2" Grid.ColumnSpan="2" IsChecked="True" Margin="0,10,0,0"><TextBlock Text="{DynamicResource Dup_SkipHidden}" TextWrapping="Wrap"/></CheckBox>
+              <TextBlock Grid.Row="3" Grid.ColumnSpan="2" Text="{DynamicResource Dup_FiltersHint}" TextWrapping="Wrap" FontSize="11" Margin="0,8,0,0"/>
+            </Grid>
+          </Expander>
         </StackPanel>
       </Border>
       <Grid Grid.Row="2" Margin="0,12,0,12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -42,16 +54,23 @@
         <TextBlock x:Name="EmptyText" Text="{DynamicResource Dup_InitialEmpty}" Foreground="{StaticResource Muted}" HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False"/>
       </Grid>
       <StackPanel Grid.Row="5" Margin="0,12,0,0">
-        <WrapPanel><Button x:Name="SelectExtrasButton" Content="{DynamicResource Dup_SelectExtras}" Click="SelectExtras_Click" IsEnabled="False" Margin="0,0,8,7" ToolTip="{DynamicResource Dup_SelectExtrasHint}"/><Button x:Name="ClearSelectionButton" Content="{DynamicResource Dup_ClearSelection}" Click="ClearSelection_Click" IsEnabled="False" Margin="0,0,8,7"/><Button Content="{DynamicResource Dup_Reveal}" Click="Reveal_Click" Margin="0,0,0,7"/></WrapPanel>
+        <WrapPanel><ComboBox x:Name="KeepRuleBox" SelectedIndex="0" Height="36" MinWidth="300" Margin="0,0,8,7" IsEnabled="False" AutomationProperties.Name="{DynamicResource Dup_KeepRuleName}" ToolTip="{DynamicResource Dup_KeepRuleName}">
+            <ComboBoxItem Tag="FirstPath" Content="{DynamicResource Dup_KeepFirst}"/><ComboBoxItem Tag="Oldest" Content="{DynamicResource Dup_KeepOldest}"/><ComboBoxItem Tag="Newest" Content="{DynamicResource Dup_KeepNewest}"/><ComboBoxItem Tag="ShortestPath" Content="{DynamicResource Dup_KeepShortest}"/><ComboBoxItem Tag="InFolder" Content="{DynamicResource Dup_KeepInFolder}"/>
+          </ComboBox><Button x:Name="SelectExtrasButton" Content="{DynamicResource Dup_SelectExtras}" Click="SelectExtras_Click" IsEnabled="False" Margin="0,0,8,7" ToolTip="{DynamicResource Dup_SelectExtrasHint}"/><Button x:Name="ClearSelectionButton" Content="{DynamicResource Dup_ClearSelection}" Click="ClearSelection_Click" IsEnabled="False" Margin="0,0,8,7"/><Button Content="{DynamicResource Dup_Reveal}" Click="Reveal_Click" Margin="0,0,0,7"/></WrapPanel>
         <TextBlock x:Name="SelectionText" Text="{DynamicResource Dup_NoSelection}" TextWrapping="Wrap" Margin="0,3,0,10"/>
         <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-          <ComboBox x:Name="RemovalModeBox" SelectedIndex="0" Height="40" SelectionChanged="Mode_Changed" Margin="0,0,10,0" AutomationProperties.Name="{DynamicResource Dup_RemovalModeName}"><ComboBoxItem Content="{DynamicResource Dup_QuarantineChoice}"/><ComboBoxItem Content="{DynamicResource Dup_PermanentChoice}"/></ComboBox>
+          <ComboBox x:Name="RemovalModeBox" SelectedIndex="0" Height="40" SelectionChanged="Mode_Changed" Margin="0,0,10,0" AutomationProperties.Name="{DynamicResource Dup_RemovalModeName}"><ComboBoxItem x:Name="RecycleChoice" Tag="RecycleBin" Content="{DynamicResource Dup_RecycleChoice}"/><ComboBoxItem Tag="Quarantine" Content="{DynamicResource Dup_QuarantineChoice}"/><ComboBoxItem Tag="Permanent" Content="{DynamicResource Dup_PermanentChoice}"/></ComboBox>
           <Button Grid.Column="1" x:Name="RemoveButton" Content="{DynamicResource Dup_ReviewSelection}" Style="{StaticResource PrimaryButton}" IsEnabled="False" Click="Remove_Click"/>
         </Grid>
-        <TextBlock x:Name="ModeDetailText" Text="{DynamicResource Dup_QuarantineHint}" TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,8,0,0"/>
+        <TextBlock x:Name="ModeDetailText" Text="{DynamicResource Dup_RecycleHint}" TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,8,0,0"/>
       </StackPanel>
       <Grid Grid.Row="6" Margin="0,14,0,20"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-        <Button x:Name="OpenQuarantineButton" Content="{DynamicResource Dup_OpenQuarantine}" Click="OpenQuarantine_Click" Visibility="Collapsed" HorizontalAlignment="Left"/>
+        <WrapPanel>
+          <Button x:Name="ExportButton" Content="{DynamicResource Dup_Export}" Click="Export_Click" IsEnabled="False" Margin="0,0,8,0"/>
+          <Button x:Name="RestoreButton" Content="{DynamicResource Dup_Restore}" Click="Restore_Click" Visibility="Collapsed" Margin="0,0,8,0"/>
+          <Button x:Name="OpenQuarantineButton" Content="{DynamicResource Dup_OpenQuarantine}" Click="OpenQuarantine_Click" Visibility="Collapsed" Margin="0,0,8,0"/>
+          <Button x:Name="LogButton" Content="{DynamicResource Dup_Log}" Click="Log_Click"/>
+        </WrapPanel>
         <Button Grid.Column="1" Content="{DynamicResource Dup_Close}" Click="Close_Click"/>
       </Grid>
     </Grid>

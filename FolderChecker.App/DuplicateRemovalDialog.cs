@@ -15,14 +15,17 @@ public sealed class DuplicateRemovalDialog : Window
         NameScope.SetNameScope(this, new NameScope());
         var chosen = paths.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var permanent = mode == DuplicateRemovalMode.Permanent;
+        var recycle = mode == DuplicateRemovalMode.RecycleBin;
         var panel = new DockPanel { Margin = new Thickness(24) };
         var header = new StackPanel();
-        header.Children.Add(new TextBlock { Text = permanent ? L.T("Supprimer les copies sélectionnées", "Delete selected copies") : L.T("Mettre les copies à l’écart", "Move copies aside"), FontSize = 24, FontWeight = FontWeights.SemiBold });
+        header.Children.Add(new TextBlock { Text = permanent ? L.T("Supprimer les copies sélectionnées", "Delete selected copies") : recycle ? L.T("Mettre les copies à la Corbeille", "Move copies to the Recycle Bin") : L.T("Mettre les copies à l’écart", "Move copies aside"), FontSize = 24, FontWeight = FontWeights.SemiBold });
         var selectedFiles = scan.Groups.SelectMany(group => group.Files).Where(file => chosen.Contains(file.FullPath)).ToArray();
         header.Children.Add(new TextBlock { Text = L.F($"{selectedFiles.Length:N0} fichier(s) · {RowView.FormatSize(selectedFiles.Sum(file => file.Size))}\nDossier : {scan.Root}", $"{selectedFiles.Length:N0} file(s) · {RowView.FormatSize(selectedFiles.Sum(file => file.Size))}\nFolder: {scan.Root}"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 12) });
         header.Children.Add(new TextBlock { Text = permanent
             ? L.T("Les fichiers ci-dessous seront supprimés définitivement, sans Corbeille. Vérifiez les chemins des fichiers retirés et des exemplaires conservés.", "The files listed below will be permanently deleted without the Recycle Bin. Review the paths of both removed and retained copies.")
-            : L.T("Les fichiers seront déplacés dans .CheckerSan-Quarantine, avec leurs chemins relatifs. Vous pourrez les remettre en place manuellement. Cette opération ne libère pas d’espace.", "Files will be moved into .CheckerSan-Quarantine with their relative paths preserved. You can restore them manually. This does not free any space."),
+            : recycle
+                ? L.T("Les fichiers ci-dessous iront dans la Corbeille de Windows, d’où vous pourrez les restaurer. L’espace est libéré quand la Corbeille est vidée.", "The files below will go to the Windows Recycle Bin, where you can restore them. The space is freed when it is emptied.")
+                : L.T("Les fichiers seront déplacés dans .CheckerSan-Quarantine, avec leurs chemins relatifs. « Restaurer des fichiers mis à l’écart… » pourra les remettre en place. Cette opération ne libère pas d’espace.", "Files will be moved into .CheckerSan-Quarantine with their relative paths preserved. Restore files moved aside… can put them back. This does not free any space."),
             Foreground = RowView.Brush("#B8B8B8"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) });
         header.Children.Add(new TextBlock { Text = L.T("Les doublons concernent le contenu principal des fichiers. Les noms, dates, autorisations et flux NTFS alternatifs peuvent différer.", "Duplicates refer to the main file contents. Names, dates, permissions and NTFS alternate streams may differ."), TextWrapping = TextWrapping.Wrap, Foreground = RowView.Brush("#B8B8B8"), Margin = new Thickness(0, 0, 0, 14) });
         DockPanel.SetDock(header, Dock.Top); panel.Children.Add(header);
@@ -31,7 +34,7 @@ public sealed class DuplicateRemovalDialog : Window
         RegisterName("PermanentConsent", consent); footer.Children.Add(consent);
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         var cancel = new Button { Content = L.T("Annuler", "Cancel"), IsCancel = true, Margin = new Thickness(0, 0, 8, 0) };
-        var confirm = new Button { Content = permanent ? L.T("Supprimer définitivement", "Delete permanently") : L.T("Mettre à l’écart", "Move aside"), IsEnabled = false, Style = (Style)Application.Current.FindResource("PrimaryButton") };
+        var confirm = new Button { Content = permanent ? L.T("Supprimer définitivement", "Delete permanently") : recycle ? L.T("Mettre à la Corbeille", "Move to the Recycle Bin") : L.T("Mettre à l’écart", "Move aside"), IsEnabled = false, Style = (Style)Application.Current.FindResource("PrimaryButton") };
         RegisterName("ConfirmRemovalButton", confirm);
         buttons.Children.Add(cancel); buttons.Children.Add(confirm); footer.Children.Add(buttons);
         DockPanel.SetDock(footer, Dock.Bottom); panel.Children.Add(footer);

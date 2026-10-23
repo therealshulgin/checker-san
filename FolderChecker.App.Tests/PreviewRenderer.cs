@@ -43,6 +43,9 @@ internal static partial class Program
         Render(duplicates, "duplicates", 1100, 850);
         var small = DuplicateUiWindow();
         Render(small, "duplicates-small", 850, 620);
+        var filters = DuplicateUiWindow();
+        DupControl<Expander>(filters, "FiltersExpander").IsExpanded = true;
+        Render(filters, "duplicates-filters", 1100, 980);
         Render(new DuplicateRemovalDialog(DuplicateUiFixture(), [@"C:\fixture\b.bin", @"C:\fixture\c.mp4", @"C:\fixture\e.zip"], DuplicateRemovalMode.Permanent), "permanent-preview", 830, 670);
     }
 }
