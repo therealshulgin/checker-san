@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -31,6 +32,8 @@ public sealed class CopyPlan
     [JsonIgnore] public int AbandonedTemporaries { get; set; }
     /// <summary>Missing paths whose name Windows would rewrite (final dot or space, reserved or malformed name): left out.</summary>
     [JsonIgnore] public int UnsupportedNames { get; set; }
+    /// <summary>Files gone or refused since the comparison, whose attributes could not be read: left out.</summary>
+    [JsonIgnore] public int UnreadableFiles { get; set; }
     public int FileCount => Items.Count(i => i.Kind == EntryKind.File);
     public long TotalBytes => Items.Where(i => i.Kind == EntryKind.File).Sum(i => i.Size);
 }
@@ -73,25 +76,177 @@ public sealed class CopyEngine
     static CopyEngine() => FileSafety.Initialize();
 
     /// <summary>
-    /// A copy needs a comparison without errors. Online-only files present on both sides stay unverified,
-    /// but they are never copied, so they do not prevent completing the folders.
+    /// A copy needs a comparison that ran to its end with both roots readable. An item with an incident (unreadable,
+    /// changed during the scan, conflict, link) is left out with everything below it, so it no longer holds back the
+    /// other items; nor is an online-only file ever copied. Existing files are never overwritten in any case.
     /// </summary>
     public static bool CanCreatePlan(ComparisonResult comparison) =>
-        !comparison.Cancelled && comparison.SnapshotVerified && comparison.Errors.Count == 0 &&
-        comparison.Rows.All(row => row.Status != ComparisonStatus.Unverified || row.OnlineOnly);
+        comparison.Finished && !comparison.Cancelled &&
+        !comparison.Rows.Any(row => row.RelativePath == "." && row.Status == ComparisonStatus.Unverified);
 
     public static CopyPlan CreatePlan(ComparisonResult comparison, bool sourceToTarget)
     {
         ValidateComparison(comparison);
+        var plan = OneWayPlan(comparison, sourceToTarget);
+        AddItems(plan, comparison, MissingRows(comparison, sourceToTarget), reverseDirection: false);
+        FinishPlan(plan);
+        return plan;
+    }
+
+    /// <summary>
+    /// Gathers into one folder the files whose contents it lacks. Unlike <see cref="CreatePlan"/>, which rebuilds the
+    /// other tree path for path, a file whose identical contents (SHA-256) lie elsewhere in the destination is not copied
+    /// again. Files keep their relative path; a missing folder is created to hold them, or when it holds no file at all.
+    /// </summary>
+    public static CopyPlan CreateGatherPlan(ComparisonResult comparison, bool intoTarget)
+    {
+        ValidateComparison(comparison);
+        var plan = OneWayPlan(comparison, intoTarget);
+        AddItems(plan, comparison, GatherRows(comparison, intoTarget, StaleCopies(comparison, intoTarget)), reverseDirection: false);
+        FinishPlan(plan);
+        return plan;
+    }
+
+    /// <summary>
+    /// Files kept out of a gathering by a copy elsewhere whose copy, or own contents, changed since the comparison: a copy
+    /// deleted or edited, a file edited. Both are queried by handle against the identity the comparison read, several at
+    /// once, since a share answers each query with a round trip. Such a file is gathered after all.
+    /// </summary>
+    private static HashSet<string> StaleCopies(ComparisonResult comparison, bool intoTarget)
+    {
+        var relying = comparison.Rows.Where(row => intoTarget
+            ? row is { Status: ComparisonStatus.Moved, SourcePath: not null, TargetPath: not null } && !(row.SourceSize < NameOnlyBelow)
+            : row is { Status: ComparisonStatus.OnlyTarget, TargetPath: not null, SourceCopyPath: not null } && !(row.TargetSize < NameOnlyBelow)).ToArray();
+        var stale = new ConcurrentBag<string>();
+        Parallel.ForEach(relying, new ParallelOptions { MaxDegreeOfParallelism = 8 }, row =>
+        {
+            var (own, copy, size) = intoTarget ? (row.SourcePath!, row.TargetPath!, row.SourceSize) : (row.TargetPath!, row.SourceCopyPath!, row.TargetSize);
+            if (!Unchanged(comparison, own, size) || !Unchanged(comparison, copy, size)) stale.Add(row.RelativePath);
+        });
+        return stale.ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool Unchanged(ComparisonResult comparison, string path, long? size)
+    {
+        try
+        {
+            if (comparison.ReadIdentities.TryGetValue(path, out var identity)) return FileSafety.CurrentIdentity(path) == identity;
+            // A file system without identities leaves the size, at least, to check.
+            return FileSafety.Stat(path).Size == size;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception) { return false; }
+    }
+
+    /// <summary>Files a gathering would copy, judged from the comparison alone: building the plan still checks each one on disk.</summary>
+    public static int GatherFileCount(ComparisonResult comparison, bool intoTarget)
+    {
+        if (!CanCreatePlan(comparison)) return 0;
+        var blocked = BlockedPaths(comparison);
+        var source = intoTarget ? comparison.SourceRoot : comparison.TargetRoot;
+        return GatherRows(comparison, intoTarget).Count(row => row.Kind == EntryKind.File && Exclusion(row, source, blocked) is null);
+    }
+
+    /// <summary>
+    /// Items of the copying folder that a gathering leaves without a proven copy in the destination: another version at
+    /// the same path, an incident, a link, an online-only file, a name Windows would alter. Temporaries are not counted.
+    /// </summary>
+    public static int GatherShortfall(ComparisonResult comparison, bool intoTarget)
+    {
+        var blocked = BlockedPaths(comparison);
+        var source = intoTarget ? comparison.SourceRoot : comparison.TargetRoot;
+        var left = GatherRows(comparison, intoTarget).Count(row => row.Kind == EntryKind.File && Exclusion(row, source, blocked) is { } reason && reason != LeftOut.Temporary);
+        bool Present(ComparisonRow row) => intoTarget ? row.SourcePath is not null : row.TargetPath is not null;
+        return left + comparison.Rows.Count(row => row.Status is ComparisonStatus.Different or ComparisonStatus.Conflict ||
+            row.Status is ComparisonStatus.Unverified or ComparisonStatus.Skipped && row.RelativePath != "." && Present(row));
+    }
+
+    private enum LeftOut { OnlineOnly, Blocked, Temporary, UnsupportedName }
+
+    /// <summary>Why a planned row cannot be copied, judged without reading the disk; null when it can. Shared by the plan and its count.</summary>
+    private static LeftOut? Exclusion(ComparisonRow row, string sourceRoot, HashSet<string> blocked)
+    {
+        // Copying an online-only file would download it, and its changing state would fail the source checks.
+        if (row.OnlineOnly) return LeftOut.OnlineOnly;
+        // An absent descendant cannot be created below an incident, a file/directory conflict or through a link.
+        var relative = row.RelativePath.Replace('/', '\\');
+        if (IsBlocked(blocked, relative)) return LeftOut.Blocked;
+        // A temporary left by an interrupted copy is a fragment, and its journal is gone: never copy it over.
+        if (row.Kind == EntryKind.File && IsCopyTemporary(Path.GetFileName(relative))) return LeftOut.Temporary;
+        // A name Windows paths cannot carry intact would be copied under another name, or not resumable from
+        // the journal: it is left out with a count, never allowed to abort the whole plan.
+        return PortableName(sourceRoot, relative) ? null : LeftOut.UnsupportedName;
+    }
+
+    private static CopyPlan OneWayPlan(ComparisonResult comparison, bool sourceToTarget)
+    {
         var source = sourceToTarget ? comparison.SourceRoot : comparison.TargetRoot;
         var target = sourceToTarget ? comparison.TargetRoot : comparison.SourceRoot;
         var plan = new CopyPlan { SourceRoot = source, TargetRoot = target, SourceCanonical = FileSafety.CanonicalDirectory(source), TargetCanonical = FileSafety.CanonicalDirectory(target),
             SourceRootId = RootId(source), TargetRootId = RootId(target) };
         ValidateRoots(plan);
-        AddMissingItems(plan, comparison, sourceToTarget, reverseDirection: false);
-        FinishPlan(plan);
         return plan;
     }
+
+    private static IEnumerable<ComparisonRow> MissingRows(ComparisonResult comparison, bool sourceToTarget) =>
+        comparison.Rows.Where(r => sourceToTarget ? r.Status is ComparisonStatus.OnlySource or ComparisonStatus.Moved : r.Status == ComparisonStatus.OnlyTarget);
+
+    /// <summary>Under this size a file is worth its name: empty markers (.gitkeep, __init__.py) or flags share their bytes with unrelated files.</summary>
+    private const long NameOnlyBelow = 4096;
+
+    /// <summary>
+    /// Files only in the copying folder with no copy of their contents in the destination, and the missing folders that
+    /// hold them. A missing folder holding only files already gathered elsewhere is not created; one holding no file is,
+    /// with the missing folders above it.
+    /// </summary>
+    private static IEnumerable<ComparisonRow> GatherRows(ComparisonResult comparison, bool intoTarget, HashSet<string>? stale = null)
+    {
+        // A copy only counts if it can be relied on: not a temporary, a quarantined duplicate or a recycled file, and
+        // unchanged when the plan is made.
+        bool Unreliable(ComparisonRow row, string? copy, string root) => copy is null || SystemFolders.NeverEvidence(FileSafety.RelativeTo(root, copy)) ||
+            stale?.Contains(row.RelativePath) == true;
+        // A file found elsewhere is a Moved row on the folder 1 side, and an only-in-2 row naming its copy on the other.
+        // A small file is copied anyway: that costs at most a cluster, and keeps its name.
+        bool Lacking(ComparisonRow row) => intoTarget
+            ? row.Status == ComparisonStatus.OnlySource ||
+                row.Status == ComparisonStatus.Moved && (row.SourceSize < NameOnlyBelow || Unreliable(row, row.TargetPath, comparison.TargetRoot))
+            : row.Status == ComparisonStatus.OnlyTarget &&
+                (row.Kind == EntryKind.Directory || row.TargetSize < NameOnlyBelow || Unreliable(row, row.SourceCopyPath, comparison.SourceRoot));
+        bool OnCopyingSide(ComparisonRow row) => intoTarget
+            ? row.Status != ComparisonStatus.OnlyTarget
+            : row.Status is not (ComparisonStatus.OnlySource or ComparisonStatus.Moved);
+        var holdingFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var holdingLacking = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in comparison.Rows.Where(row => row.Kind == EntryKind.File && OnCopyingSide(row)))
+        {
+            var lacking = Lacking(row) && !row.OnlineOnly;
+            foreach (var folder in Ancestors(row.RelativePath))
+            {
+                holdingFiles.Add(folder);
+                if (lacking) holdingLacking.Add(folder);
+            }
+        }
+        // A folder holding no file is kept, and so are the missing folders above it, which would otherwise be created
+        // on the way without their dates and attributes.
+        foreach (var row in comparison.Rows.Where(row => row.Kind == EntryKind.Directory && Lacking(row) && !holdingFiles.Contains(row.RelativePath)))
+            foreach (var folder in Ancestors(row.RelativePath)) holdingLacking.Add(folder);
+        return comparison.Rows.Where(row => Lacking(row) && (row.Kind == EntryKind.File ||
+            holdingLacking.Contains(row.RelativePath) || !holdingFiles.Contains(row.RelativePath)));
+    }
+
+    private static IEnumerable<string> Ancestors(string relative)
+    {
+        relative = relative.Replace('/', '\\');
+        for (var end = relative.IndexOf('\\'); end > 0; end = relative.IndexOf('\\', end + 1))
+            yield return relative[..end];
+    }
+
+    private static HashSet<string> BlockedPaths(ComparisonResult comparison) => comparison.Rows
+        .Where(r => r.Status is ComparisonStatus.Conflict or ComparisonStatus.Unverified or ComparisonStatus.Skipped)
+        .Select(r => r.RelativePath.Replace('/', '\\').TrimEnd('\\'))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Below an incident, a conflict or a link. Looked up per ancestor: thousands of online-only files must not multiply the work.</summary>
+    private static bool IsBlocked(HashSet<string> blocked, string relative) => blocked.Count > 0 && Ancestors(relative).Any(blocked.Contains);
 
     public static CopyPlan CreateBidirectionalPlan(ComparisonResult comparison)
     {
@@ -107,8 +262,8 @@ public sealed class CopyEngine
             TargetRootId = RootId(comparison.TargetRoot)
         };
         ValidateRoots(plan);
-        AddMissingItems(plan, comparison, sourceToTarget: true, reverseDirection: false);
-        AddMissingItems(plan, comparison, sourceToTarget: false, reverseDirection: true);
+        AddItems(plan, comparison, MissingRows(comparison, sourceToTarget: true), reverseDirection: false);
+        AddItems(plan, comparison, MissingRows(comparison, sourceToTarget: false), reverseDirection: true);
         FinishPlan(plan);
         return plan;
     }
@@ -116,41 +271,44 @@ public sealed class CopyEngine
     private static void ValidateComparison(ComparisonResult comparison)
     {
         if (!CanCreatePlan(comparison))
-            throw new InvalidOperationException(L.T("Terminez une comparaison sans erreur avant de préparer une copie.", "Complete a comparison without errors before preparing a copy."));
+            throw new InvalidOperationException(L.T("Terminez une comparaison, sans l’arrêter et avec les deux dossiers lisibles, avant de préparer une copie.", "Finish a comparison, without stopping it and with both folders readable, before preparing a copy."));
     }
 
-    private static void AddMissingItems(CopyPlan plan, ComparisonResult comparison, bool sourceToTarget, bool reverseDirection)
+    private static void AddItems(CopyPlan plan, ComparisonResult comparison, IEnumerable<ComparisonRow> rows, bool reverseDirection)
     {
         var source = reverseDirection ? plan.TargetRoot : plan.SourceRoot;
-        var blocked = comparison.Rows
-            .Where(r => r.Status is ComparisonStatus.Conflict or ComparisonStatus.Unverified or ComparisonStatus.Skipped)
-            .Select(r => r.RelativePath.Replace('/', '\\').TrimEnd('\\') + "\\")
-            .ToArray();
-        // Copying an online-only file would download it, and its changing state would fail the source checks.
-        foreach (var row in comparison.Rows.Where(r => !r.OnlineOnly && (sourceToTarget
-                     ? r.Status is ComparisonStatus.OnlySource or ComparisonStatus.Moved
-                     : r.Status == ComparisonStatus.OnlyTarget)))
+        var blocked = BlockedPaths(comparison);
+        foreach (var row in rows)
         {
-            // An absent descendant cannot be created below a file/directory conflict or through a link.
-            var relative = row.RelativePath.Replace('/', '\\');
-            if (blocked.Any(prefix => relative.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))) continue;
-            // A temporary left by an interrupted copy is a fragment, and its journal is gone: never copy it over.
-            if (row.Kind == EntryKind.File && IsCopyTemporary(Path.GetFileName(relative))) { plan.AbandonedTemporaries++; continue; }
-            // A name Windows paths cannot carry intact would be copied under another name, or not resumable from
-            // the journal: it is left out with a count, never allowed to abort the whole plan.
-            if (!PortableName(source, relative)) { plan.UnsupportedNames++; continue; }
+            switch (Exclusion(row, source, blocked))
+            {
+                case LeftOut.Temporary: plan.AbandonedTemporaries++; continue;
+                case LeftOut.UnsupportedName: plan.UnsupportedNames++; continue;
+                case not null: continue;
+            }
             var path = SafePath(source, row.RelativePath);
             AssertNoLinks(source, path);
             var item = new CopyItem { RelativePath = row.RelativePath, Kind = row.Kind, ReverseDirection = reverseDirection,
                 CreatedByCopy = row.Kind == EntryKind.Directory ? false : null };
             if (row.Kind == EntryKind.File)
             {
-                using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                item.Size = file.Length;
-                item.LastWriteUtc = File.GetLastWriteTimeUtc(file.SafeFileHandle);
-                item.CreationUtc = File.GetCreationTimeUtc(file.SafeFileHandle);
-                item.Attributes = File.GetAttributes(file.SafeFileHandle) & CopiedAttributes;
-                item.SourceIdentity = IdentityText(FileSafety.Identity(file.SafeFileHandle));
+                // Opened for its attributes only, which other programs' sharing modes do not deny: a file held open by
+                // one (a mailbox, a virtual disk) is still planned, and copying it later fails for that item alone. A file
+                // gone or refused since the comparison is counted, never allowed to abort the whole plan.
+                try
+                {
+                    using var file = FileSafety.OpenAttributes(path);
+                    item.Size = RandomAccess.GetLength(file);
+                    item.LastWriteUtc = File.GetLastWriteTimeUtc(file);
+                    item.CreationUtc = File.GetCreationTimeUtc(file);
+                    item.Attributes = File.GetAttributes(file) & CopiedAttributes;
+                    item.SourceIdentity = IdentityText(FileSafety.Identity(file));
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or Win32Exception)
+                {
+                    plan.UnreadableFiles++;
+                    continue;
+                }
             }
             else
             {

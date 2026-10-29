@@ -87,7 +87,10 @@ public static class CheckerSanCli
         var json = options.GetValueOrDefault("json");
         var store = options.GetValueOrDefault("pairs");
         var simulateCopy = options.GetValueOrDefault("simulate-copy")?.ToLowerInvariant();
-        if (simulateCopy is not (null or "both" or "1to2" or "2to1")) return Usage(error, "--simulate-copy accepts both, 1to2 or 2to1.");
+        if (simulateCopy is not (null or "both" or "1to2" or "2to1" or "into1" or "into2")) return Usage(error, "--simulate-copy accepts both, 1to2, 2to1, into1 or into2.");
+        // Without the search for moved files, gathering would copy every file missing at its path: a disguised 1to2 or 2to1.
+        if (simulateCopy is "into1" or "into2" && options.ContainsKey("no-moved"))
+            return Usage(error, L.T("--simulate-copy into1|into2 a besoin de la recherche des fichiers déplacés : retirez --no-moved.", "--simulate-copy into1|into2 needs the search for moved files: remove --no-moved."));
         try
         {
             return (positional[0].ToLowerInvariant(), positional.Count) switch
@@ -125,9 +128,15 @@ public static class CheckerSanCli
             output.WriteLine(L.T("! Des éléments réels font face à des liens ou jonctions non suivis : leur contenu n’est pas comparé.",
                 "! Real items face links or junctions that are not followed: their contents are not compared."));
         output.WriteLine(Verdict(code, L.T("Les deux dossiers sont identiques.", "Both folders are identical."), L.T("Des différences sont prouvées.", "Differences are proven.")));
+        string Answer(bool? value) => value is { } known ? known ? L.T("Oui", "Yes") : L.T("Non", "No") : L.T("Non vérifié", "Not verified");
+        var holds1 = ComparisonVerdicts.Folder2HoldsFolder1(result);
+        var holds2 = ComparisonVerdicts.Folder1HoldsFolder2(result);
+        output.WriteLine(L.F($"Le dossier 2 contient tout le dossier 1 : {Answer(holds1)} · le dossier 1 contient tout le dossier 2 : {Answer(holds2)}",
+            $"Folder 2 contains all of folder 1: {Answer(holds1)} · folder 1 contains all of folder 2: {Answer(holds2)}"));
         foreach (var problem in result.Errors.Take(20)) output.WriteLine("! " + problem);
+        foreach (var warning in result.Warnings) output.WriteLine("· " + warning);
         var simulation = simulateCopy is null ? null : SimulateCopy(result, simulateCopy, output);
-        if (json is not null) WriteJson(json, new { Application = "Checker San", Command = "compare", ExitCode = code, Result = result, CopySimulation = simulation }, result.SourceRoot, result.TargetRoot);
+        if (json is not null) WriteJson(json, new { Application = "Checker San", Command = "compare", ExitCode = code, Folder2HoldsFolder1 = holds1, Folder1HoldsFolder2 = holds2, Result = result, CopySimulation = simulation }, result.SourceRoot, result.TargetRoot);
         ActivityLog.Write("CLI compare", $"{result.SourceRoot} ↔ {result.TargetRoot} · exit {code} · {differences} difference(s) · {result.Errors.Count} error(s)" +
             (simulateCopy is null ? "" : $" · copy simulated ({simulateCopy})"), log);
         return code;
@@ -140,12 +149,17 @@ public static class CheckerSanCli
         output.WriteLine(L.T("SIMULATION — rien n’est copié.", "SIMULATION — nothing is copied."));
         if (!CopyEngine.CanCreatePlan(result))
         {
-            output.WriteLine(L.T("Simulation impossible : la comparaison doit être complète et sans erreur.", "Cannot simulate: the comparison must be complete and without errors."));
+            output.WriteLine(L.T("Simulation impossible : la comparaison doit aller à son terme, avec les deux dossiers lisibles.", "Cannot simulate: the comparison must run to its end, with both folders readable."));
             return null;
         }
-        var plan = direction == "both" ? CopyEngine.CreateBidirectionalPlan(result) : CopyEngine.CreatePlan(result, direction == "1to2");
+        var plan = direction switch
+        {
+            "both" => CopyEngine.CreateBidirectionalPlan(result),
+            "into1" or "into2" => CopyEngine.CreateGatherPlan(result, intoTarget: direction == "into2"),
+            _ => CopyEngine.CreatePlan(result, direction == "1to2")
+        };
         var needs = CopyEngine.SpaceNeeds(plan);
-        string Arrow(CopyItem item) => plan.Bidirectional ? item.ReverseDirection ? "2 → 1" : "1 → 2" : direction == "1to2" ? "1 → 2" : "2 → 1";
+        string Arrow(CopyItem item) => plan.Bidirectional ? item.ReverseDirection ? "2 → 1" : "1 → 2" : direction is "1to2" or "into2" ? "1 → 2" : "2 → 1";
         foreach (var item in plan.Items.Take(200))
             output.WriteLine($"{L.T("COPIERAIT", "WOULD COPY")} {Arrow(item)}  {(item.Kind == EntryKind.Directory ? L.T("[dossier]", "[folder]") : L.Size(item.Size))}  {item.RelativePath}");
         if (plan.Items.Count > 200) output.WriteLine(L.F($"… et {plan.Items.Count - 200} autre(s).", $"… and {plan.Items.Count - 200} more."));
@@ -156,9 +170,15 @@ public static class CheckerSanCli
                 $"Free space on {need.Root}: {L.Size(need.Available)} · needed: {L.Size(need.Required)}{(need.Sufficient ? "" : " — NOT ENOUGH")}"));
         var conflicts = result.Rows.Count(row => row.Status is ComparisonStatus.Different or ComparisonStatus.Conflict);
         if (conflicts > 0) output.WriteLine(L.F($"{conflicts:N0} contenu(s) différent(s) ou conflit(s) ne seraient pas remplacés.", $"{conflicts:N0} different file(s) or conflict(s) would not be replaced."));
+        if (plan.UnsupportedNames > 0) output.WriteLine(L.F($"{plan.UnsupportedNames:N0} chemin(s) au nom que Windows modifierait écarté(s) : à copier à la main.", $"{plan.UnsupportedNames:N0} path(s) with a name Windows would alter left out: copy them by hand."));
+        if (plan.AbandonedTemporaries > 0) output.WriteLine(L.F($"{plan.AbandonedTemporaries:N0} fichier(s) temporaire(s) d’une copie interrompue écarté(s).", $"{plan.AbandonedTemporaries:N0} temporary file(s) from an interrupted copy left out."));
+        if (plan.UnreadableFiles > 0) output.WriteLine(L.F($"{plan.UnreadableFiles:N0} fichier(s) disparu(s) ou illisible(s) depuis la comparaison écarté(s).", $"{plan.UnreadableFiles:N0} file(s) gone or unreadable since the comparison left out."));
+        int? shortfall = direction is "into1" or "into2" ? CopyEngine.GatherShortfall(result, intoTarget: direction == "into2") : null;
+        if (shortfall > 0) output.WriteLine(L.F($"{shortfall:N0} élément(s) resteraient sans exemplaire prouvé dans le dossier de destination.", $"{shortfall:N0} item(s) would still have no proven copy in the destination folder."));
         return new
         {
             Direction = direction, plan.FileCount, plan.TotalBytes, Space = needs,
+            plan.UnsupportedNames, plan.AbandonedTemporaries, plan.UnreadableFiles, LeftWithoutCopy = shortfall,
             Items = plan.Items.Select(item => new { Direction = Arrow(item), item.Kind, item.RelativePath, item.Size })
         };
     }
@@ -341,7 +361,7 @@ public static class CheckerSanCli
         """
         Checker San en ligne de commande — rien n’est jamais copié, déplacé ni supprimé.
 
-          checkersan-cli compare <dossier1> <dossier2> [--json rapport.json] [--no-moved] [--simulate-copy both|1to2|2to1]
+          checkersan-cli compare <dossier1> <dossier2> [--json rapport.json] [--no-moved] [--simulate-copy both|1to2|2to1|into1|into2]
           checkersan-cli snapshot <dossier> <instantané.json>
           checkersan-cli verify <dossier> <instantané.json> [--json rapport.json]
           checkersan-cli duplicates <dossier> [--json rapport.json] [--min-size octets] [--exclude "a;b"] [--include-hidden]
@@ -349,15 +369,16 @@ public static class CheckerSanCli
           checkersan-cli pairs                      (paires enregistrées dans Checker San)
           checkersan-cli run <nom de la paire>      (rapport dans %LOCALAPPDATA%\CheckerSan\Reports)
 
-        Simulations : --simulate-copy liste ce que « Compléter les dossiers » copierait ; --simulate-keep liste les copies
-        qu’une règle retirerait. Rien n’est copié ni retiré.
+        Simulations : --simulate-copy liste ce que « Compléter les dossiers » copierait (into1 / into2 : regrouper dans
+        le dossier 1 ou 2 sans recopier les contenus qu’il a déjà ailleurs, incompatible avec --no-moved) ; --simulate-keep
+        liste les copies qu’une règle retirerait. Rien n’est copié ni retiré.
         Options communes : --readers 1-16 (lectures simultanées), --lang en|fr, --log fichier (journal d’activité), --pairs fichier.
         Codes de sortie : 0 rien à signaler · 1 écarts ou doublons prouvés · 2 vérification incomplète (erreurs, fichiers non lus, éléments réels face à des liens) · 3 commande invalide ou erreur.
         """,
         """
         Checker San command line — nothing is ever copied, moved or deleted.
 
-          checkersan-cli compare <folder1> <folder2> [--json report.json] [--no-moved] [--simulate-copy both|1to2|2to1]
+          checkersan-cli compare <folder1> <folder2> [--json report.json] [--no-moved] [--simulate-copy both|1to2|2to1|into1|into2]
           checkersan-cli snapshot <folder> <snapshot.json>
           checkersan-cli verify <folder> <snapshot.json> [--json report.json]
           checkersan-cli duplicates <folder> [--json report.json] [--min-size bytes] [--exclude "a;b"] [--include-hidden]
@@ -365,8 +386,9 @@ public static class CheckerSanCli
           checkersan-cli pairs                      (pairs saved in Checker San)
           checkersan-cli run <pair name>            (report in %LOCALAPPDATA%\CheckerSan\Reports)
 
-        Simulations: --simulate-copy lists what Complete folders would copy; --simulate-keep lists the copies a rule
-        would remove. Nothing is copied or removed.
+        Simulations: --simulate-copy lists what Complete folders would copy (into1 / into2: gather into folder 1 or 2
+        without copying contents it already holds elsewhere, not with --no-moved); --simulate-keep lists the copies a
+        rule would remove. Nothing is copied or removed.
         Common options: --readers 1-16 (simultaneous reads), --lang en|fr, --log file (activity log), --pairs file.
         Exit codes: 0 nothing to report · 1 proven differences or duplicates · 2 incomplete verification (errors, unread files, real items facing links) · 3 invalid command or error.
         """);

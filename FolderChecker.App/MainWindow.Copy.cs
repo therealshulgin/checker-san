@@ -10,29 +10,49 @@ public partial class MainWindow
 {
     private readonly string _copyCheckpointPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CheckerSan", "Sessions", "copy.json");
     private CopyPlan? _savedCopy;
+    /// <summary>The subfolder a box was narrowed to by « Compare with this folder », until the boxes are edited: the verdict recalls it.</summary>
+    private FolderAlignment.Suggestion? _narrowedFrom;
     internal static void ApplyDarkTitleBar(Window window)
     { int dark = 1; DwmSetWindowAttribute(new WindowInteropHelper(window).Handle, 20, ref dark, sizeof(int)); }
-    private bool ShowsFolders(string first, string second)
+    private static bool SameFolder(string box, string root)
     {
-        static bool Same(string box, string root)
-        {
-            try { return string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(box.Trim().Trim('"'))), Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)), StringComparison.OrdinalIgnoreCase); }
-            catch (ArgumentException) { return false; }
-        }
-        return Same(SourceBox.Text, first) && Same(TargetBox.Text, second);
+        try { return string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(box.Trim().Trim('"'))), Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)), StringComparison.OrdinalIgnoreCase); }
+        catch (ArgumentException) { return false; }
     }
+    private bool ShowsFolders(string first, string second) => SameFolder(SourceBox.Text, first) && SameFolder(TargetBox.Text, second);
     private void RefreshCopy()
     {
         _savedCopy = CopyEngine.ReadPlan(_copyCheckpointPath);
         TransferButton.IsEnabled = _cancellation == null && ((_result is not null && CopyEngine.CanCreatePlan(_result)) || (_savedCopy?.Items.Any(i => !i.Completed) == true));
         TransferButton.Content = _savedCopy?.Items.Any(i => !i.Completed) == true ? L.T("Compléter / reprendre…", "Complete / resume…") : L.T("Compléter les dossiers…", "Complete folders…");
+        GatherInto1Button.IsEnabled = GatherInto2Button.IsEnabled = _cancellation == null && _result is not null;
+        // The saved copy just read decides the buttons' wording: resuming it comes first.
+        if (_result is { } result && _cancellation == null && GatherInto1Button.Visibility == Visibility.Visible | GatherInto2Button.Visibility == Visibility.Visible)
+        {
+            ShowGather(GatherInto1Button, result, intoTarget: false);
+            ShowGather(GatherInto2Button, result, intoTarget: true);
+        }
     }
-    private async void Transfer_Click(object sender, RoutedEventArgs e)
+    private void Transfer_Click(object sender, RoutedEventArgs e) => Transfer(null);
+    private void GatherInto1_Click(object sender, RoutedEventArgs e) => Transfer(CopyDialog.Mode.IntoFolder1);
+    private void GatherInto2_Click(object sender, RoutedEventArgs e) => Transfer(CopyDialog.Mode.IntoFolder2);
+    private async void Transfer(CopyDialog.Mode? initial)
     {
         if (_cancellation != null) return;
         RefreshCopy();
-        var dialog = new CopyDialog(_result, _savedCopy) { Owner = this };
-        if (dialog.ShowDialog() != true || dialog.Plan is not {} plan) return;
+        var dialog = new CopyDialog(_result, _savedCopy, initial) { Owner = this };
+        var accepted = dialog.ShowDialog() == true;
+        if (dialog.CompareInstead is { } aligned)
+        {
+            // Changing a box sets the current verdict aside; the comparison is then started by the user. The narrowing is
+            // recorded after the change, which clears any earlier one, so the next verdict recalls what it leaves out.
+            (aligned.InFolder2 ? TargetBox : SourceBox).Text = aligned.Folder;
+            _narrowedFrom = aligned;
+            CompareButton.Focus();
+            return;
+        }
+        if (!accepted || dialog.Plan is not {} plan) return;
+        var gathering = dialog.SelectedMode is CopyDialog.Mode.IntoFolder1 or CopyDialog.Mode.IntoFolder2;
         // A copy invalidates every previous comparison verdict as soon as writes may begin.
         _refreshStatus = null;
         _result = null; _rows = []; _view = null; ResultsGrid.ItemsSource = null;
@@ -44,7 +64,8 @@ public partial class MainWindow
         { SourceBox.Text = plan.SourceRoot; TargetBox.Text = plan.TargetRoot; }
         _cancellation = new CancellationTokenSource(); SetBusy(true);
         TransferButton.IsEnabled = false;
-        VerdictTitle.Text = plan.Bidirectional ? L.T("Complétion des deux dossiers", "Completing both folders") : L.T("Copie des éléments manquants", "Copying missing items");
+        VerdictTitle.Text = plan.Bidirectional ? L.T("Complétion des deux dossiers", "Completing both folders")
+            : gathering ? L.T("Regroupement des fichiers manquants", "Gathering missing files") : L.T("Copie des éléments manquants", "Copying missing items");
         VerdictCard.Background = RowView.Brush("#242424");
         EmptyState.Visibility = Visibility.Visible; EmptyTitle.Text = L.T("Copie avec reprise et vérification SHA-256", "Resumable copy with SHA-256 verification");
         EmptyDetail.Text = L.T("Les fichiers existants ne seront pas écrasés.", "Existing files will not be overwritten.");
@@ -66,7 +87,9 @@ public partial class MainWindow
             SetStatus(() =>
             {
                 VerdictTitle.Text = copy.Complete ? L.T("Copie terminée et vérifiée", "Copy complete and verified") : copy.Cancelled ? L.T("Copie interrompue — reprise disponible", "Copy stopped — resume available") : L.T("Copie incomplète — des éléments restent à traiter", "Copy incomplete — some items still need processing");
-                VerdictDetail.Text = copy.Complete ? L.T("Les chemins manquants ont été copiés et vérifiés par SHA-256. Les contenus différents n’ont pas été remplacés. Relancez une comparaison pour contrôler les écarts restants.", "Missing paths have been copied and verified with SHA-256. Differing contents were not replaced. Run another comparison to check remaining differences.") : L.T("Utilisez « Compléter / reprendre… » pour poursuivre. ", "Use Complete / resume to continue. ") + string.Join(" ", copy.Errors.Take(3));
+                VerdictDetail.Text = !copy.Complete ? L.T("Utilisez « Compléter / reprendre… » pour poursuivre. ", "Use Complete / resume to continue. ") + string.Join(" ", copy.Errors.Take(3))
+                    : gathering ? L.T("Les contenus absents ont été copiés et vérifiés par SHA-256 ; ceux déjà présents ailleurs n’ont pas été recopiés, et les contenus différents n’ont pas été remplacés. Relancez une comparaison pour contrôler le résultat.", "Missing contents have been copied and verified with SHA-256; those already present elsewhere were not copied again, and differing contents were not replaced. Run another comparison to check the result.")
+                    : L.T("Les chemins manquants ont été copiés et vérifiés par SHA-256. Les contenus différents n’ont pas été remplacés. Relancez une comparaison pour contrôler les écarts restants.", "Missing paths have been copied and verified with SHA-256. Differing contents were not replaced. Run another comparison to check remaining differences.");
                 VerdictCard.ToolTip = copy.Errors.Count > 0 ? string.Join("\n", copy.Errors) : null;
                 VerdictCard.Background = RowView.Brush("#242424");
                 FooterText.Text = L.F($"{copy.CompletedFiles:N0} / {copy.TotalFiles:N0} fichiers terminés · {RowView.FormatSize(copy.BytesWritten)} copiés · {RowView.FormatSize(copy.BytesResumed)} repris · {copy.Errors.Count:N0} incident(s)", $"{copy.CompletedFiles:N0} / {copy.TotalFiles:N0} files completed · {RowView.FormatSize(copy.BytesWritten)} copied · {RowView.FormatSize(copy.BytesResumed)} resumed · {copy.Errors.Count:N0} issue(s)");

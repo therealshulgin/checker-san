@@ -50,6 +50,13 @@ internal static partial class Program
         ("A scheduled result explains differences or failures without taking the focus", ScheduledResultExplainsTheCheck),
         ("The copy preview exports what would be copied, outside both folders", CopyPreviewExportsWhatWouldBeCopied),
         ("After a copy from folder 2 to folder 1, folder 1 and folder 2 stay in their boxes", CopyKeepsFolderOneAndTwo),
+        ("Each verdict lacking files offers to gather them, with their count", GatherButtonsFollowTheVerdicts),
+        ("Incidents no longer prevent gathering or completing the other items", GatherDespiteIncidents),
+        ("Gathering leaves out what the destination already holds elsewhere", GatherDialogSkipsWhatIsElsewhere),
+        ("A folder held in a subfolder of the other is named, with an offer to compare with it", GatherSuggestsTheSubfolder),
+        ("A gathering never claims every file is there without the comparison's proof", GatherNeverClaimsCompletenessWhileContentsAreMissing),
+        ("An unfinished copy of the same folders comes before a gathering", GatherButtonKeepsTheSavedCopyFirst),
+        ("Screen, dialog, details and report say what a gathering does", GatherWordingMatchesWhatHappens),
         ("Duplicate results start with no files selected", DuplicateUiStartsUnselected),
         ("Selecting extra copies keeps one file per group and blocks all-selected groups", DuplicateUiKeepsOne),
         ("Changing the duplicate folder invalidates earlier results", DuplicateUiChangedPath),
@@ -529,7 +536,7 @@ internal static partial class Program
             SourcePath = Path.Combine(workspace.Source, "song.wav"), TargetPath = Path.Combine(workspace.Target, "song.wav"),
             SourceHash = Hash("audio"), TargetHash = Hash("audio"), SourceSize = 5, TargetSize = 5,
         }],
-        Errors = [], SnapshotVerified = true, SourceFullyContained = true, TargetFullyContained = true, TreesIdentical = true,
+        Errors = [], Finished = true, MovedFilesSearched = true, SnapshotVerified = true, SourceFullyContained = true, TargetFullyContained = true, TreesIdentical = true,
         ContentCovered = true, SourceFileCount = 1, TargetFileCount = 1, FilesVerified = 2, BytesRead = 10,
     };
 

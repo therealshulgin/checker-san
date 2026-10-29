@@ -22,6 +22,9 @@ public static class ReportWriter
                 Application = "Checker San 1.0", Algorithm = L.T("SHA-256 (contenu complet)", "SHA-256 (complete contents)"),
                 Scope = L.T("Flux principal des fichiers et arborescence. Hors droits NTFS, flux alternatifs et métadonnées du système de fichiers.",
                     "Main file data stream and folder structure. Excludes NTFS permissions, alternate data streams and filesystem metadata."),
+                // true, false, or null when not verified: the answers shown on screen.
+                Folder2HoldsFolder1 = ComparisonVerdicts.Folder2HoldsFolder1(result),
+                Folder1HoldsFolder2 = ComparisonVerdicts.Folder1HoldsFolder2(result),
                 result
             }, options));
             return;
@@ -36,9 +39,8 @@ public static class ReportWriter
             L.T("Début", "Started"), L.T("Fin", "Completed"), L.T("Annulé", "Cancelled"),
             L.T("Instantané vérifié", "Snapshot verified"), L.T("Dossier 2 contient tout le dossier 1", "Folder 2 contains all of folder 1"),
             L.T("Arborescences identiques", "Identical folder trees"), L.T("Dossier 1 contient tout le dossier 2", "Folder 1 contains all of folder 2")]);
-        var verified = !result.Cancelled && result.SnapshotVerified && result.Errors.Count == 0 &&
-            result.Rows.All(row => row.Status != ComparisonStatus.Unverified);
-        var meta = new[] { result.SourceRoot, result.TargetRoot, result.StartedAt.ToString("O"), result.CompletedAt.ToString("O"), YesNo(result.Cancelled), YesNo(result.SnapshotVerified), verified ? YesNo(result.SourceFullyContained) : L.T("Non vérifié", "Not verified"), YesNo(result.TreesIdentical), verified ? YesNo(result.TargetFullyContained) : L.T("Non vérifié", "Not verified") };
+        string Verdict(bool? value) => value is { } known ? YesNo(known) : L.T("Non vérifié", "Not verified");
+        var meta = new[] { result.SourceRoot, result.TargetRoot, result.StartedAt.ToString("O"), result.CompletedAt.ToString("O"), YesNo(result.Cancelled), YesNo(result.SnapshotVerified), Verdict(ComparisonVerdicts.Folder2HoldsFolder1(result)), YesNo(result.TreesIdentical), Verdict(ComparisonVerdicts.Folder1HoldsFolder2(result)) };
         WriteLine(writer, new[] { L.T("Résumé", "Summary"), "", "", "", "", "", "", "", "", L.F(
             $"Comparaison SHA-256 du contenu principal et de l’arborescence ; hors droits et flux NTFS alternatifs. Empreintes reprises après contrôle : {result.FilesReused}. Point de reprise sauvegardé : {YesNo(result.CheckpointSaved)}.",
             $"SHA-256 comparison of main file contents and folder structure; excludes permissions and alternate NTFS streams. Hashes reused after validation: {result.FilesReused}. Checkpoint saved: {YesNo(result.CheckpointSaved)}.") }.Concat(meta));

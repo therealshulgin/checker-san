@@ -47,6 +47,8 @@ public sealed class ComparisonEngine
         private readonly Dictionary<string, string?> _hashes = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string?> _samples = new(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _coveredSourceFiles = new(StringComparer.OrdinalIgnoreCase);
+        // Full path of a file named by rows at another path than its own (a moved file's copy, a copy found in folder 1) → those rows.
+        private readonly Dictionary<string, List<string>> _referencedBy = new(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _errors = new(StringComparer.Ordinal);
         private readonly HashSet<string> _warnings = new(StringComparer.Ordinal);
         private readonly Dictionary<string, CheckpointFile> _checkpointFiles = new(StringComparer.OrdinalIgnoreCase);
@@ -79,6 +81,7 @@ public sealed class ComparisonEngine
             var scansComplete = false;
             var cancelled = false;
             var snapshotVerified = false;
+            var finished = false;
 
             try
             {
@@ -150,7 +153,10 @@ public sealed class ComparisonEngine
                 }
 
                 if (options.FindMovedFiles)
+                {
                     await FindMovedFilesAsync(sourceSnapshot, targetSnapshot);
+                    await FindTargetCopiesAsync(sourceSnapshot, targetSnapshot);
+                }
                 MarkCaseDifferences(sourceSnapshot, targetSnapshot);
 
                 cancellationToken.ThrowIfCancellationRequested();
@@ -164,6 +170,7 @@ public sealed class ComparisonEngine
                 var contentsStable = await VerifyReadIdentitiesAsync();
                 snapshotVerified = sourceStable && targetStable && contentsStable && _errors.Count == 0;
                 cancellationToken.ThrowIfCancellationRequested();
+                finished = true;
                 SetPhase(L.T("Comparaison terminée", "Comparison completed"));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -206,11 +213,17 @@ public sealed class ComparisonEngine
                 StartedAt = started,
                 CompletedAt = DateTimeOffset.Now,
                 Cancelled = cancelled,
+                Finished = finished && !cancelled,
+                MovedFilesSearched = options.FindMovedFiles,
                 SnapshotVerified = snapshotVerified && !cancelled,
                 SourceFullyContained = sourceContained,
                 TargetFullyContained = targetContained,
                 TreesIdentical = sourceContained && targetContained,
                 ContentCovered = certain && _coveredSourceFiles.Count == sourceFileCount,
+                TargetContentCovered = certain && targetSnapshot.Entries.Values
+                    .Where(item => item.Kind == EntryKind.File && item.Access != EntryAccess.Link)
+                    .All(item => _rows.TryGetValue(item.RelativePath, out var row) &&
+                        (row.Status == ComparisonStatus.Identical || row is { Status: ComparisonStatus.OnlyTarget, SourceCopyPath: not null })),
                 SourceFileCount = sourceFileCount,
                 TargetFileCount = targetSnapshot.Entries.Values.LongCount(item => item.Kind == EntryKind.File && item.Access != EntryAccess.Link),
                 FilesVerified = _filesHashed,
@@ -220,7 +233,8 @@ public sealed class ComparisonEngine
                 HasCheckpoint = _hasCheckpoint,
                 CheckpointSaved = _checkpointSaved,
                 CheckpointPath = _checkpointPath,
-                Warnings = _warnings.ToArray()
+                Warnings = _warnings.ToArray(),
+                ReadIdentities = _readIdentities.ToDictionary(pair => pair.Key, pair => pair.Value.Identity, StringComparer.OrdinalIgnoreCase)
             };
         }
 
@@ -468,6 +482,9 @@ public sealed class ComparisonEngine
                 return;
             }
 
+            // At the root of a volume, the recycle bin and restore points are the system's, not the user's: their
+            // contents would count as copies that a purge then removes, and their other users' folders are unreadable.
+            var volumeRoot = options.TreatRootsAsVolumes || FileSafety.IsVolumeRoot(snapshot.Root);
             var pending = new Stack<string>();
             pending.Push(snapshot.Root);
             while (pending.TryPop(out var directory))
@@ -480,6 +497,16 @@ public sealed class ComparisonEngine
                     // Each attempt stays private until enumeration completes. A failed network
                     // attempt cannot leave duplicate entries or queued descendants behind.
                     var batch = await RetryIoAsync(() => ReadDirectoryBatch(snapshot.Root, directory), directory);
+                    if (volumeRoot && directory == snapshot.Root && batch is not null)
+                    {
+                        var system = batch.Where(entry => entry.Kind == EntryKind.Directory && SystemFolders.IsVolumeSystemFolder(entry.RelativePath)).ToArray();
+                        if (system.Length > 0)
+                        {
+                            batch = batch.Except(system).ToList();
+                            _warnings.Add(L.F($"Racine de volume « {snapshot.Root} » : {string.Join(", ", system.Select(entry => entry.RelativePath))} écarté(s) de la comparaison (corbeille et dossiers système).",
+                                $"Volume root ‘{snapshot.Root}’: {string.Join(", ", system.Select(entry => entry.RelativePath))} left out of the comparison (recycle bin and system folders)."));
+                        }
+                    }
                     if (batch is null)
                     {
                         MarkDirectoryProblem(snapshot, directory, L.T("Lien symbolique ou point de jonction ignoré.", "Symbolic link or junction skipped."));
@@ -578,13 +605,13 @@ public sealed class ComparisonEngine
         {
             var problem = L.F($"« {fullPath} » : {reason}", $"‘{fullPath}’: {reason}");
             _errors.Add(problem);
-            var relative = Path.GetRelativePath(snapshot.Root, fullPath);
-            if (relative == ".")
-            {
-                if (snapshot.RootEntry is not null) snapshot.RootEntry = snapshot.RootEntry with { Problem = problem };
-            }
-            else if (snapshot.Entries.TryGetValue(relative, out var entry))
+            // The listed name, as the inventory keyed it: GetRelativePath would strip a final dot or space and miss it.
+            var relative = FileSafety.RelativeTo(snapshot.Root, fullPath);
+            if (relative != "." && snapshot.Entries.TryGetValue(relative, out var entry))
                 snapshot.Entries[relative] = entry with { Problem = problem };
+            // An error held by no row would hold nothing back, and copies are allowed despite incidents: one whose folder
+            // cannot be found counts against the whole root, which refuses any copy.
+            else if (snapshot.RootEntry is not null) snapshot.RootEntry = snapshot.RootEntry with { Problem = problem };
         }
 
         private void BuildInitialRows(Snapshot sourceSnapshot, Snapshot targetSnapshot)
@@ -738,8 +765,9 @@ public sealed class ComparisonEngine
         private async Task FindMovedFilesAsync(Snapshot sourceSnapshot, Snapshot targetSnapshot)
         {
             SetPhase(L.T("Recherche des fichiers déplacés ou renommés", "Looking for moved or renamed files"));
+            // A temporary, a quarantined duplicate or a recycled file is never the copy a source file is found as.
             var candidatesBySize = targetSnapshot.Entries.Values
-                .Where(Readable)
+                .Where(item => Readable(item) && !SystemFolders.NeverEvidence(item.RelativePath))
                 .GroupBy(item => item.Size!.Value)
                 .ToDictionary(group => group.Key, group => new CandidateBucket(
                     group.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray()));
@@ -803,6 +831,7 @@ public sealed class ComparisonEngine
                         TargetHash = sourceHash,
                         Detail = L.F($"Même contenu SHA-256 trouvé ailleurs dans le dossier 2 : {match.RelativePath}", $"The same SHA-256 contents were found elsewhere in folder 2: {match.RelativePath}")
                     };
+                    Reference(match.FullPath, item.RelativePath);
                 }
                 else
                 {
@@ -811,6 +840,52 @@ public sealed class ComparisonEngine
                         Detail = row.Detail + L.F($" Une copie du contenu source existe aussi dans le dossier 2 : {match.RelativePath}", $" A copy of the source contents also exists in folder 2: {match.RelativePath}")
                     };
                 }
+            }
+        }
+
+        /// <summary>
+        /// The other way round: a file only in folder 2 whose contents lie elsewhere in folder 1 keeps its status, and its
+        /// row names that copy. Gathering into folder 1 then leaves it out. Every source file sharing a
+        /// size with a target file was hashed by the search above, unless its sample matched none of them; so only targets
+        /// of the same size and sample as a hashed source file, and not yet read, are hashed here.
+        /// </summary>
+        private async Task FindTargetCopiesAsync(Snapshot sourceSnapshot, Snapshot targetSnapshot)
+        {
+            var bySize = new Dictionary<long, List<Entry>>();
+            var byHash = new Dictionary<string, Entry>(StringComparer.Ordinal);
+            foreach (var item in sourceSnapshot.Entries.Values.Where(item => Readable(item) && !SystemFolders.NeverEvidence(item.RelativePath))
+                         .OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!_hashes.TryGetValue(item.FullPath, out var digest) || digest is null) continue;
+                byHash.TryAdd(digest, item);
+                if (!bySize.TryGetValue(item.Size!.Value, out var group)) bySize[item.Size.Value] = group = [];
+                group.Add(item);
+            }
+            foreach (var item in targetSnapshot.Entries.Values.Where(Readable))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!_rows.TryGetValue(item.RelativePath, out var row) || row.Status != ComparisonStatus.OnlyTarget ||
+                    !bySize.TryGetValue(item.Size!.Value, out var sameSize))
+                    continue;
+                if (!_hashes.TryGetValue(item.FullPath, out var digest))
+                {
+                    if (ShouldSample(item))
+                    {
+                        var sample = await SampleAsync(item);
+                        if (sample is null) continue;
+                        bool Possible(Entry source) { lock (_gate) return !_samples.TryGetValue(source.FullPath, out var known) || known is null || known == sample; }
+                        if (!sameSize.Any(Possible)) continue;
+                    }
+                    digest = await HashAsync(item);
+                }
+                if (digest is null || !byHash.TryGetValue(digest, out var copy)) continue;
+                _rows[item.RelativePath] = row with
+                {
+                    SourceCopyPath = copy.FullPath,
+                    TargetHash = digest,
+                    Detail = row.Detail + L.F($" Même contenu SHA-256 présent ailleurs dans le dossier 1 : {copy.RelativePath}", $" The same SHA-256 contents are elsewhere in folder 1: {copy.RelativePath}")
+                };
+                Reference(copy.FullPath, item.RelativePath);
             }
         }
 
@@ -1002,11 +1077,6 @@ public sealed class ComparisonEngine
         }
 
         /// <summary>
-        /// The last listing compares directory entries, which miss an in-place write that keeps size and date,
-        /// or any write through another hard link. Each file behind an Identical or Moved row is therefore
-        /// queried by handle: a new change time or identity means its hash no longer proves anything.
-        /// </summary>
-        /// <summary>
         /// Paths are paired ignoring case, as Windows does. Where the two names differ by case the row says so, and in
         /// a case-sensitive folder (WSL, per-folder setting) they are two different names, never identical.
         /// </summary>
@@ -1024,12 +1094,18 @@ public sealed class ComparisonEngine
             }
         }
 
+        /// <summary>
+        /// The last listing compares directory entries, which miss an in-place write that keeps size and date,
+        /// or any write through another hard link. Each file behind an Identical or Moved row, or behind a copy found
+        /// in folder 1 for a file only in folder 2, is therefore queried by handle: a new change time or identity
+        /// means its hash no longer proves anything.
+        /// </summary>
         private async Task<bool> VerifyReadIdentitiesAsync()
         {
             List<(string Path, Entry Entry, FileIdentity Identity)> proven;
             lock (_gate)
-                proven = _rows.Values.Where(row => row.Status is ComparisonStatus.Identical or ComparisonStatus.Moved)
-                    .SelectMany(row => new[] { row.SourcePath, row.TargetPath }).OfType<string>()
+                proven = _rows.Values.Where(row => row.Status is ComparisonStatus.Identical or ComparisonStatus.Moved || row.SourceCopyPath is not null)
+                    .SelectMany(row => new[] { row.SourcePath, row.TargetPath, row.SourceCopyPath }).OfType<string>()
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .Where(_readIdentities.ContainsKey)
                     .Select(path => (path, _readIdentities[path].Entry, _readIdentities[path].Identity)).ToList();
@@ -1106,15 +1182,34 @@ public sealed class ComparisonEngine
             return stable;
         }
 
-        private void MarkUnverified(Entry entry, string reason)
+        /// <summary>Records a row naming a file at another path than its own, so an incident on that file finds the row without scanning them all.</summary>
+        private void Reference(string fullPath, string rowKey)
         {
             lock (_gate)
-                foreach (var pair in _rows.ToArray())
+            {
+                if (!_referencedBy.TryGetValue(fullPath, out var keys)) _referencedBy[fullPath] = keys = [];
+                keys.Add(rowKey);
+            }
+        }
+
+        private void MarkUnverified(Entry entry, string reason)
+        {
+            bool Same(string? path) => string.Equals(path, entry.FullPath, StringComparison.OrdinalIgnoreCase);
+            lock (_gate)
+            {
+                // A row names a file at its own path, or at another one recorded by Reference.
+                var keys = _referencedBy.TryGetValue(entry.FullPath, out var others) ? others.Prepend(entry.RelativePath).ToArray() : [entry.RelativePath];
+                foreach (var key in keys.Distinct(StringComparer.OrdinalIgnoreCase))
                 {
-                    if (string.Equals(pair.Value.SourcePath, entry.FullPath, StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(pair.Value.TargetPath, entry.FullPath, StringComparison.OrdinalIgnoreCase))
-                        _rows[pair.Key] = pair.Value with { Status = ComparisonStatus.Unverified, Detail = reason };
+                    if (!_rows.TryGetValue(key, out var row)) continue;
+                    if (Same(row.SourcePath) || Same(row.TargetPath))
+                        _rows[key] = row with { Status = ComparisonStatus.Unverified, Detail = reason };
+                    // The file of folder 2 is intact: only the copy that kept it out of a gathering into folder 1 no
+                    // longer proves anything, so it is missing from folder 1 again, and will be copied.
+                    else if (Same(row.SourceCopyPath))
+                        _rows[key] = row with { SourceCopyPath = null, Detail = row.Detail + L.T(" L’exemplaire trouvé dans le dossier 1 a changé pendant la comparaison : il ne compte plus.", " The copy found in folder 1 changed during the comparison: it no longer counts.") };
                 }
+            }
         }
 
         private void SetPhase(string phase)

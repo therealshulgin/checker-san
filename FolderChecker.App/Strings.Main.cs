@@ -55,6 +55,7 @@ public static class MainStrings
             ["Main_SearchName"] = ("Rechercher dans les résultats", "Search results"),
             ["Main_SearchPlaceholder"] = ("Rechercher un fichier ou un chemin…", "Search for a file or path…"),
             ["Main_CompleteFolders"] = ("Compléter les dossiers…", "Complete the folders…"),
+            ["Main_GatherTip"] = ("Copie dans ce dossier les fichiers dont le contenu y manque, sans recopier ceux qu’il a déjà ailleurs (SHA-256). Ce qui ne peut pas être copié est listé avant la copie ; rien n’est remplacé ni supprimé.", "Copies into this folder the files whose contents it lacks, without copying those it already has elsewhere (SHA-256). What cannot be copied is listed before copying; nothing is replaced or deleted."),
             ["Main_Export"] = ("Exporter…", "Export…"),
             ["Main_StatusColumn"] = ("ÉTAT", "STATUS"),
             ["Main_TypeColumn"] = ("TYPE", "TYPE"),

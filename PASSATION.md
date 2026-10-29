@@ -181,8 +181,9 @@ Journal par défaut :
 %LOCALAPPDATA%\CheckerSan\Sessions\copy.json
 ```
 
-- Préparation d’une nouvelle copie seulement depuis une comparaison complète sans erreur ; aperçu du sens, des chemins, du nombre de fichiers et du volume.
+- Préparation d’une nouvelle copie depuis une comparaison menée à son terme (`ComparisonResult.Finished`, ni arrêtée ni interrompue par une coupure), avec les deux racines lisibles. Depuis le 28 octobre 2026, les incidents ne bloquent plus la copie : chaque élément `Unverified`, `Skipped` ou `Conflict` est écarté avec tout ce qu’il contient. Aperçu du sens, des chemins, du nombre de fichiers et du volume.
 - Sens 1 → 2 : lignes `OnlySource` et `Moved` (leur chemin source manque bien dans le 2). Sens 2 → 1 : lignes `OnlyTarget`. Compléter les deux dossiers copie ces deux ensembles dans une seule opération. Les contenus déjà retrouvés ailleurs sont volontairement recopiés à leurs chemins manquants, ce qui peut conserver plusieurs noms du même contenu. Les éléments différents/conflits et les descendants des conflits de type sont exclus ; ils ne sont pas remplacés.
+- **Regrouper** (`CreateGatherPlan(result, intoTarget)`) : seulement les fichiers dont la destination n’a aucun exemplaire, même ailleurs. Vers le 2 : lignes `OnlySource` (pas `Moved`). Vers le 1 : lignes `OnlyTarget` sans `SourceCopyPath`. Les fichiers gardent leur chemin relatif ; un dossier manquant n’est créé que s’il contient un fichier regroupé, ou aucun fichier. Voir la section du 28 octobre.
 - `CreatePlan(result, bool)` conserve les plans unidirectionnels avec racines orientées. `CreateBidirectionalPlan(result)` garde les racines 1/2 et active `CopyPlan.Bidirectional`. Chaque `CopyItem.ReverseDirection` indique 2 → 1 (true) ou 1 → 2 (false). Les métadonnées et identités source sont revalidées avant transfert. Les nouveaux plans ont `Schema=2` ; les anciens schéma 1, sans directions inversées, restent lisibles et reprenables. Les combinaisons ambiguës de schéma/direction sont refusées avant écriture.
 - Écriture dans `.checkersan-<GUID>.partial`, dans le dossier de destination. La destination finale existante n’est jamais écrasée.
 - À la reprise : identification du temporaire, comparaison octet par octet de son préfixe avec la source, puis poursuite à l’offset déjà écrit. Cette vérification nécessite de relire la partie transférée.
@@ -268,6 +269,123 @@ Les fixtures restent sous `.test-data/ui-general`. Les deux journaux `%LOCALAPPD
 L’automatisation native de l’interface a utilisé le skill `computer-use` et `@oai/sky` via le REPL Node. Pour la reprendre, relire les instructions disponibles dans la nouvelle session et sélectionner une fenêtre actuelle ; les anciens identifiants de fenêtres et index de contrôles sont périmés.
 
 La livraison précédente ajoutait la copie bidirectionnelle en une opération et la palette noire/grise. Ses 85 tests automatisés passaient, dont les trois choix du dialogue et la reprise dans le second sens. Le lancement pour contrôle visuel a été interrompu par l’utilisateur avec la touche Échap : aucune autre automatisation native n’a été effectuée ensuite et le contrôle visuel de cette dernière palette reste à faire. Les fixtures créées à cet effet se trouvent dans `.test-data/ui-sync-4065442190d649a7800d6f0ed5c76e18` ; aucun scan ni transfert n’a été lancé dessus depuis l’interface. Les journaux de session étaient absents avant cette tentative.
+
+## Regrouper dans le dossier 1 ou 2 — 28 octobre 2026 (non commité, au-dessus de `b5399b7`)
+
+> **Revue adverse du regroupement : `revue/regroupement/` (rapports rouges et bleus, `ARBITRAGE.md`).** Une faille critique : sur une racine de disque comme `G:\`, la Corbeille compte comme un exemplaire présent, et le fichier n'est pas copié. Trois défauts de gravité haute :
+> - les temporaires `.partial` comptent aussi comme exemplaires présents ;
+> - la quarantaine des doublons aussi ;
+> - « Comparer avec ce dossier » peut retirer de la comparaison les fichiers à regrouper.
+>
+> Les lots A, B et C de l'arbitrage sont faits (sections suivantes).
+
+### Lot A de la revue du regroupement — 29 octobre 2026 (non commité)
+
+- **Racine de volume (REG-M01).**
+  - `SystemFolders.IsVolumeRoot` compare `GetVolumePathNameW` et la racine sans leur séparateur final : `G:\` le garde toujours.
+  - Sur une telle racine (lecteur, point de montage, racine de partage), `ScanAsync` écarte au premier niveau les dossiers `$RECYCLE.BIN`, `RECYCLER`, `System Volume Information`, `.Trashes`, `.Trash-*`, `#recycle` (Synology) et `@Recycle` (QNAP).
+  - Un avertissement les nomme. Ils ne sont pas marqués `Skipped`, ce statut étant affiché comme « lien non suivi ».
+  - Les erreurs des dossiers système illisibles disparaissent du même coup. Une racine de disque peut donc de nouveau donner un verdict complet.
+  - Pour les tests, `ComparisonOptions.TreatRootsAsVolumes` est interne et se règle par réflexion.
+- **Jamais une preuve de présence (REG-M02, piste 3 du moteur).** `SystemFolders.NeverEvidence(chemin relatif)` est vrai :
+  - pour un temporaire de copie ;
+  - pour tout ce qui est sous `.CheckerSan-Quarantine` ;
+  - pour tout ce qui est sous l'un des dossiers système ci-dessus, à toute profondeur.
+
+  Ces fichiers ne sont plus candidats dans `FindMovedFilesAsync`, ni exemplaires dans `FindTargetCopiesAsync`. Ils ne votent pas dans `FolderAlignment`. `GatherRows` traite comme manquante une ligne dont l'exemplaire en est un, par défense en profondeur.
+- **Moins de 4 Kio (REG-M03).** `GatherRows` copie un tel fichier même si son contenu existe ailleurs. La comparaison et « Compléter » ne changent pas, et `FolderAlignment` ignore ces fichiers.
+  - Au passage (piste 3 du parcours, lot B), les dossiers manquants qui contiennent un dossier vide retenu sont créés avec leurs dates.
+- **Toute erreur a sa ligne (piste 1 du moteur).**
+  - `MarkDirectoryProblem` cherche l'entrée par `FileSafety.RelativeTo`, et non plus par `Path.GetRelativePath`, qui retirait le point final de `Archives.`.
+  - Une erreur qui ne trouve pas sa ligne marque la racine, ce qui fait refuser toute copie.
+- **Complétude prouvée (REG-P02, REG-M04, REG-P04).**
+  - `CopyEngine.Exclusion` est la règle « copiable » commune à `AddItems` et à `GatherFileCount` : en ligne seulement, sous un incident, temporaire, nom non portable. Le nombre du bouton est celui du plan.
+  - `GatherShortfall` compte ce qui reste sans exemplaire prouvé : autre version, conflit, incident ou lien du côté copié, et éléments écartés (sauf les temporaires).
+  - `ComparisonResult.TargetContentCovered` est ajouté, symétrique de `ContentCovered`.
+  - Le dialogue n'écrit « ce dossier a déjà un exemplaire de chaque fichier » que si l'indicateur du mode est vrai. Sinon il écrit « Rien à copier automatiquement… », et annonce partout le nombre d'éléments qui resteront sans exemplaire.
+- **Sous-dossier suggéré (REG-P01).**
+  - Seuil : plus de la moitié des fichiers du dossier rangé ailleurs, et plus de la moitié des appariés.
+  - `Suggestion.Outside` compte les fichiers qui sortiraient de la comparaison.
+  - Le bandeau du dialogue n'apparaît que lorsque le sous-dossier est la destination : `InFolder2` avec « Regrouper dans le 2 » ou « Compléter le 2 », et le symétrique.
+  - Le détail du verdict (`AlignmentVerdictText`) explique les deux sens.
+- **La reprise d'abord (REG-P03, point 1).** Une copie inachevée des mêmes dossiers, dans un sens ou dans l'autre, est présélectionnée même quand le dialogue est ouvert par « Tout regrouper ».
+- **Aide FR/EN** : règles de 4 Kio, des corbeilles et de la suggestion. « À côté de chaque Non » devient « à côté d'un Non, quand des fichiers peuvent être copiés ».
+- **Tests.**
+  - 5 tests moteur ajoutés : Corbeille et quarantaine (avec la vraie racine de `C:`), temporaires dans les deux sens, fichiers vides et minuscules, décompte de ce qui reste, dossier `Archives.`.
+  - 2 tests WPF ajoutés : complétude jamais affirmée sans preuve, reprise d'abord.
+  - Tests existants renforcés : contenus de 5 000 octets pour rester au-dessus du seuil ; visibilité du bandeau selon le mode ; seuil de « la plupart ».
+  - **163 tests moteur réussis trois fois de suite, 44 tests WPF réussis deux fois.**
+  - Reproductions rouges et bleues rejouées sur le moteur corrigé : `recycle`, `partial-into2`, `partial-into1`, `empty`, `empty-tiny`, `silent`, `trailing-dot`, `quarantine`, ainsi que les scénarios d'interface `nothing`, `blocked`, `names` et `resume`. Toutes sont corrigées.
+### Lots B et C de la revue du regroupement — 29 octobre 2026
+
+**Lot B — robustesse et messages.**
+- **REG-M08.** Quand l'exemplaire du 1 change pendant le scan, `MarkUnverified` retire seulement `SourceCopyPath`. Le fichier du 2, intact, reste `OnlyTarget` : il est regroupé, et complété par « Compléter le 1 ».
+- **REG-M07.** `AddItems` lit taille, dates, attributs et identité par `FileSafety.OpenAttributes`, un handle `FILE_READ_ATTRIBUTES` que les modes de partage des autres programmes ne refusent pas.
+  - Un fichier ouvert ailleurs (`.pst`, disque virtuel) est planifié ; sa copie échoue seule.
+  - Un fichier disparu ou refusé depuis la comparaison est compté dans `CopyPlan.UnreadableFiles` au lieu de faire échouer le plan.
+- **REG-M09.** Le CLI refuse `--no-moved` avec `into1|into2` (code 3). Il affiche :
+  - les noms écartés, les temporaires et les illisibles, pour tous les modes ;
+  - le nombre d'éléments qui resteront sans exemplaire (regroupement) ;
+  - les deux réponses d'inclusion ;
+  - les avertissements.
+
+  Le JSON reçoit `Folder2HoldsFolder1`, `Folder1HoldsFolder2` et les compteurs de la simulation.
+- **REG-P06.** `ComparisonVerdicts` (moteur) donne la règle à trois états, utilisée par l'écran, le CSV, l'enveloppe JSON du rapport et le CLI.
+- **REG-P03, points 2 et 3.**
+  - Lancer une autre copie que la reprise demande confirmation, avec le nombre et la taille des temporaires qui resteraient (`CopyDialog.OrphanTemporaries`). Rien n'est supprimé.
+  - Le bouton dit « Reprendre la copie inachevée, puis regrouper dans le N… » quand la copie enregistrée porte sur ces dossiers.
+  - L'espace des temporaires orphelins est déjà retiré de l'espace libre mesuré : aucun ajout à `SpaceNeeds` n'est nécessaire.
+- **REG-P05.**
+  - Nouvelle infobulle.
+  - « sans recopier ce qu'il a déjà » disparaît sans recherche des déplacés.
+  - Le titre (« Tout regrouper dans un dossier ») et le texte des écarts suivent le mode.
+  - Message de fin propre au regroupement.
+  - Le verdict dit « Le dossier N a un exemplaire de chaque fichier de l'autre, parfois à un autre chemin » seulement sur `ContentCovered` ou `TargetContentCovered` et sans fichier à copier : jamais sur un simple décompte, cas `trou2` de l'équipe bleue.
+- **REG-P07.** Le détail d'une ligne affiche « N (même contenu, autre chemin) : … », « Copie dans le dossier N » et « SHA-256 (copie dans N) ». La même convention vaut pour les lignes « Retrouvé ailleurs ».
+- **REG-P01, point 4.** Après « Comparer avec ce dossier », le verdict suivant rappelle la restriction et le nombre de fichiers laissés de côté (`_narrowedFrom`), jusqu'à ce qu'une case soit modifiée.
+- La piste 3 du parcours était déjà faite avec le lot A.
+
+**Lot C.**
+- **REG-M06.** `CreateGatherPlan` revérifie par handle, 8 à la fois, chaque fichier écarté parce qu'il a un exemplaire ailleurs, et cet exemplaire, contre l'identité lue par la comparaison (`ComparisonResult.ReadIdentities`, interne). Sans identité, la taille sert de contrôle.
+  - Un exemplaire supprimé ou modifié, ou un fichier modifié, est regroupé.
+  - Le scénario rouge `stale` est corrigé.
+- **Piste 4 du moteur.** `MarkUnverified` ne parcourt plus toutes les lignes. Il lit la ligne du chemin même, puis un index des lignes qui nomment ce fichier ailleurs (`_referencedBy`, rempli pour `Moved` et `SourceCopyPath`).
+  - Mesure, 20 040 lignes dont 2 000 fichiers modifiés pendant le contrôle final : la phase passe à 3,3 s (de 2,9 à 4,4 s sans modification), contre 8,2 s avant l'index d'après la mesure de l'équipe bleue.
+- **REG-M05.** La documentation était déjà corrigée. La recherche inverse à la demande n'est pas faite, faute de mesure sur le vrai disque qui la justifie.
+
+**Tests.**
+- 3 tests moteur ajoutés : revérification au moment du plan, fichier verrouillé ou disparu, CLI.
+- `GatherRechecksCopiesFoundInFolderOne` est renforcé : M08, plus un fichier déplacé retrouvé par l'index.
+- 1 test WPF ajouté : textes, détail, rapport, bouton de reprise, rappel de restriction, temporaires orphelins. `GatherDespiteIncidents` vérifie le CSV.
+- **166 tests moteur réussis trois fois de suite, 45 tests WPF réussis deux fois.**
+- Scénarios `copychange`, `stale`, `locked` et `markunverified-cost` rejoués et corrigés.
+
+Demande de l’utilisateur après un vrai scan : `\\PC\_Working_folder` face à `G:\`. Le scan a duré 1 h 51 et lu 75 Gio, avec 12 incidents, 0 fichier identique, 40 973 retrouvés ailleurs, 610 absents du 2 et 55 512 absents du 1. Il n’y avait aucun moyen simple de tout regrouper sur l’un des deux disques, pour deux raisons :
+- « Compléter les dossiers… » était grisé dès le premier incident : `CanCreatePlan` exigeait zéro erreur ;
+- ses trois modes recopient chemin par chemin, donc aussi les 40 973 fichiers déjà présents ailleurs.
+
+**Ce qui change :**
+- **Copie malgré les incidents.** `CopyEngine.CanCreatePlan` exige désormais `Finished` et une racine lisible : pas de ligne `.` en `Unverified`. Les éléments avec incident sont écartés avec leur contenu, par recherche de leurs ancêtres dans un `HashSet`. L’ancien test, préfixe par préfixe, aurait coûté lignes × incidents : 10 000 fichiers OneDrive en ligne face à 100 000 lignes représentent un milliard de comparaisons.
+- **`ComparisonResult.Finished`** : toutes les phases ont tourné jusqu’au contrôle final. **`MovedFilesSearched`** indique si les fichiers ont aussi été cherchés sous d’autres chemins.
+- **Recherche inverse** (`FindTargetCopiesAsync`, après `FindMovedFilesAsync`). Une ligne `OnlyTarget` dont le contenu existe ailleurs dans le 1 garde son statut, mais reçoit `SourceCopyPath`, `TargetHash` et une phrase dans `Detail`.
+  - Seules les cibles de même taille qu’un fichier source déjà haché, et de même échantillon au-delà de 4 Mio, sont lues ; toutes les autres sources de cette taille l’ont déjà été dans le premier sens.
+  - Ce champ est distinct de `SourcePath`, pour garder une seule ligne par fichier du 1 : cinq anciens tests l’ont rappelé.
+  - Les copies ainsi trouvées passent par le contrôle final par handle (`VerifyReadIdentitiesAsync`) et par `MarkUnverified`.
+- **`CreateGatherPlan` et `GatherFileCount`** : `GatherFileCount` compte sans accès disque, pour les boutons. La simulation CLI accepte `--simulate-copy into1|into2`.
+- **Interface.**
+  - Les verdicts « Le dossier N contient tout… » disent « Non » malgré des incidents dès qu’un chemin n’existe que d’un côté, ou qu’un écart est prouvé. Sinon, « Non vérifié » comme avant.
+  - À côté de chaque « Non », un bouton « Tout regrouper dans le N · X fichier(s) à copier… » ouvre le dialogue sur ce mode.
+  - Le dialogue a deux choix de plus, après les trois existants : les index 0 à 2 sont inchangés pour les tests. Il ajoute une note sur les incidents écartés et une note propre à chaque mode.
+  - `FolderAlignment.Suggest` repère le cas probable de l’utilisateur : plus de la moitié des fichiers appariés se trouvent sous un même sous-dossier de l’autre côté. Le verdict nomme ce sous-dossier, et le dialogue propose « Comparer avec ce dossier », qui remplit la case sans lancer la comparaison.
+  - « Ouvrir dans le 1 » ouvre la copie trouvée ailleurs.
+  - Correction au passage : le choix du dialogue rend son libellé dans `ToString()`. Le rendu hors écran affichait `Choice { Label = … }`.
+- **Mesures** (CLI de `dist` du 23 octobre contre le nouveau, NVMe, médiane de 6 passages alternés) :
+  - Cas réaliste : 4 000 fichiers de 10 à 200 Ko déplacés, 400 doublons et 2 000 fichiers en plus dans le 2. Lecture +5,5 % (796 → 840 Mo, surtout les 400 doublons), temps 4,51 s → 4,61 s, dans le bruit. Regrouper dans le 1 copie 2 000 fichiers (200 Mo) ; « Compléter le dossier 1 » en copierait 6 400 (637 Mo).
+  - Cas défavorable : mêmes volumes, mais seulement 40 tailles distinctes. Lecture +29 % (622 → 803 Mo), temps 8,6 s → 12,1 s. **Ce n'est pas une borne** (revue, REG-M05) : le surcoût vaut au plus une lecture des fichiers en plus du 2 qui partagent une taille avec un fichier lu du 1. Il atteint ×6 en lectures quand toutes les tailles sont égales ; sur des tailles réalistes, l'équipe bleue mesure de 0 à +52 % de fichiers lus (+8,7 % d'octets).
+  - Une paire alignée (sauvegarde au même chemin) n’a presque pas de lignes `OnlyTarget` : coût négligeable.
+- **Tests :** 6 tests moteur (`GatherTests.cs`) et 4 tests WPF (`GatherUiTests.cs`). `VerifiedResult` porte maintenant `Finished = true`. Rendus `main-gather` et `gather-dialog` ajoutés à `--render`. **158 tests moteur réussis trois fois de suite ; 42 tests WPF réussis trois fois, dont la dernière après la toute dernière modification (le `ToString()` du dialogue).**
+- **Distribution reconstruite le 28 octobre 2026 à 22:38** avec `build.ps1 -Test` : 158 tests moteur et 42 tests WPF réussis. SHA-256 de `CheckerSan.exe` : `D618B8F23C02C3CD7265C539C64521AE5996D91D3139FAC8B03B568A07DE291A`. SHA-256 de `checkersan-cli.exe` : `D4AF50E929E6CC2E736FD2456EF7F6991BCCD888F04DAA45E06A3C844A1EFDD6`. `CheckerSan.rar` de l’utilisateur inchangé (empreinte vérifiée avant et après).
+- **Non fait :** pas d’essai sur les vrais dossiers de l’utilisateur. Les fichiers regroupés gardent leur chemin relatif : si les racines sont décalées, utiliser la suggestion de sous-dossier avant de regrouper. Les doublons internes au dossier copié sont copiés tels quels, car la comparaison ne lit pas les fichiers sans taille commune avec l’autre côté. Un regroupement qui n’en copierait qu’un exemplaire reste une piste.
 
 ## Revue adverse et lot A « verdicts justes » — 23 octobre 2026 (non commité, au-dessus du lot automatisation)
 

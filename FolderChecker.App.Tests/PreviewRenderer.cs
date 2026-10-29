@@ -38,6 +38,31 @@ internal static partial class Program
         }
         var main = new MainWindow();
         Render(main, "main", 1220, 900);
+        using (var workspace = new TestWorkspace())
+        {
+            // Folder 2 holds folder 1 in a subfolder, with files missing on each side and one unreadable file.
+            var seed = 1;
+            foreach (var name in new[] { "a.txt", "b.txt", "c.txt" })
+            {
+                var body = Body(seed++);
+                File.WriteAllBytes(Path.Combine(workspace.Source, name), body);
+                Directory.CreateDirectory(Path.Combine(workspace.Target, "Sauvegarde"));
+                File.WriteAllBytes(Path.Combine(workspace.Target, "Sauvegarde", name), body);
+            }
+            File.WriteAllText(Path.Combine(workspace.Source, "nouveau.txt"), "only in 1");
+            File.WriteAllText(Path.Combine(workspace.Target, "musique.mp3"), "only in 2");
+            File.WriteAllText(Path.Combine(workspace.Source, "verrou.txt"), "same");
+            File.WriteAllText(Path.Combine(workspace.Target, "verrou.txt"), "same");
+            ComparisonResult compared;
+            using (new FileStream(Path.Combine(workspace.Source, "verrou.txt"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                compared = new ComparisonEngine().CompareAsync(workspace.Source, workspace.Target, new ComparisonOptions()).GetAwaiter().GetResult();
+            var gather = new MainWindow();
+            ShowCompared(gather, workspace, compared);
+            Render(gather, "main-gather", 1220, 900);
+            var dialog = new CopyDialog(compared, null, CopyDialog.Mode.IntoFolder2);
+            AwaitPreview(dialog);
+            Render(dialog, "gather-dialog", 880, 760);
+        }
         var duplicates = DuplicateUiWindow();
         DupInvoke(duplicates, "SelectExtras_Click", duplicates, new RoutedEventArgs());
         Render(duplicates, "duplicates", 1100, 850);

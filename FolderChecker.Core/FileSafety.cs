@@ -122,6 +122,19 @@ internal static class FileSafety
     }
 
     /// <summary>
+    /// A file opened for its attributes only, without following a link: sharing modes set by other programs apply to
+    /// reading and writing, not to this, so a file another program holds open can still be described.
+    /// </summary>
+    internal static SafeFileHandle OpenAttributes(string path)
+    {
+        var handle = CreateFileW(Native(path), 0x80, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+        if (!handle.IsInvalid) return handle;
+        var error = Marshal.GetLastWin32Error();
+        handle.Dispose();
+        throw new Win32Exception(error);
+    }
+
+    /// <summary>
     /// Identity of a path queried on a handle opened for attributes only. Directory entries can lag behind a
     /// write made through another hard link; the file's own record cannot, and every write moves its change time.
     /// </summary>
@@ -170,6 +183,23 @@ internal static class FileSafety
     {
         using var handle = CreateFileW(Native(directory), 0x80, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
         return !handle.IsInvalid && GetFileInformationByHandleEx(handle, 23, out uint flags, sizeof(uint)) && (flags & 1) != 0;
+    }
+
+    /// <summary>
+    /// Whether a folder is the root of a volume: a drive (G:\), a mount point or the root of a share, where the system keeps
+    /// its recycle bin and restore points. Both paths are compared without their final separator, which G:\ always keeps.
+    /// </summary>
+    internal static bool IsVolumeRoot(string path)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        var volume = new StringBuilder(32768);
+        try
+        {
+            var full = Path.GetFullPath(path);
+            return GetVolumePathNameW(Path.EndsInDirectorySeparator(full) ? full : full + Path.DirectorySeparatorChar, volume, (uint)volume.Capacity) &&
+                string.Equals(Path.TrimEndingDirectorySeparator(volume.ToString()), Path.TrimEndingDirectorySeparator(full), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException) { return false; }
     }
 
     /// <summary>

@@ -160,6 +160,20 @@ internal static partial class Program
         ("LocalizationCopyEnglishPreservesPaths", LocalizationCopyEnglishPreservesPaths),
         ("LocalizationRemovalErrorsEnglish", LocalizationRemovalErrorsEnglish),
         ("LocalizationFrenchCanBeRestored", LocalizationFrenchCanBeRestored),
+        ("Gathering skips contents found elsewhere, in both directions", GatherSkipsContentsFoundElsewhere),
+        ("Gathering proceeds despite incidents, leaving them out", GatherProceedsDespiteIncidents),
+        ("A folder 1 copy relied on by a gathering is rechecked by handle", GatherRechecksCopiesFoundInFolderOne),
+        ("Large second copies are found by sample before being hashed", GatherFindsLargeCopiesBySample),
+        ("A folder held in a subfolder of the other is suggested", FolderAlignmentSuggestsTheSubfolder),
+        ("Counting the files to gather stays fast on large results", GatherCountStaysFastOnLargeResults),
+        ("A drive's Recycle Bin, a quarantine or a recycled file never counts as a kept copy", GatherIgnoresRecycleBinAndQuarantine),
+        ("The temporary of an interrupted copy never counts as a kept copy", GatherIgnoresInterruptedTemporaries),
+        ("Empty and tiny files are gathered with their names", GatherKeepsEmptyFiles),
+        ("A gathering counts what it leaves behind, and its button counts what it copies", GatherCountsWhatItLeavesBehind),
+        ("A folder that cannot be listed holds back what it contains", GatherBlocksUnlistedFolders),
+        ("A copy relied on is checked again when the gathering is planned", GatherRechecksCopiesWhenPlanning),
+        ("A file held open by another program is planned, and fails alone", GatherSurvivesALockedUnreadFile),
+        ("The command line gathers like the app and gives the same containment answers", GatherOnTheCommandLine),
     ];
 
     public static async Task<int> Main(string[] args)
